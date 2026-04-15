@@ -8,7 +8,8 @@ from astropy.time import Time
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 DATA_FILE = "lc_GRB260207A_cand47734_cleaned"
-T_BURST_BTJD = Time("2026-02-07 05:40:16.947").jd -2457000   # BTJD of T_burst
+# T_BURST_TJD = Time("2026-02-07 05:40:16.947").jd -2457000   # TJD of T_burst, rough
+T_BURST_BTJD = Time("2026-02-07 05:42:41.348").jd -2457000   # BTJD of T_burst
 
 df = pd.read_csv(
     DATA_FILE,
@@ -18,7 +19,7 @@ df = pd.read_csv(
            "mag", "e_mag", "bkg", "bkg_model", "bkg2", "e_bkg2"],
 )
 
-df["t_shifted"] = df["TJD"] - T_BURST_BTJD
+df["t_shifted"] = df["BTJD"] - T_BURST_BTJD
 df["flux1"] = df["cts_per_s"]
 
 # ── Re-zero using median from 12 h to 2 h pre-burst ──────────────────────────
@@ -97,106 +98,6 @@ try:
 except RuntimeError as exc:
     print(f"Fit did not converge: {exc}")
     fit_okwind = False
-# ── REVERSE SBPL fit: data between -0.002 and 0.02 days ─────────────────────────────
-def dsbpl(x, A, xb1, xb2,alpha1,alpha2,alpha3):
-    """
-    Multiplicative smoothly broken power law
-    """
-    # Thick shell, slow cooling  (maybe?)
-    # alpha1=-1/3
-    # alpha2=(p-1)/2
-    # alpha3=p/2
-    # Thin shell, crossing (doesn't work here)
-    # alpha1=-2
-    # alpha2=-1/3
-    # alpha3=((p-1)/2)
-    # Fast cooling
-    alpha1=-alpha1
-    alpha2=-alpha2
-    alpha3=-alpha3
-    s=0.02
-    s1=s
-    s2=s
-    x = np.asarray(x)
-
-    term1 = (x / xb1) ** (-alpha1)
-
-    smooth1 = (1 + (x / xb1) ** (1.0 / s1)) ** ((alpha1 - alpha2) * s1)
-    smooth2 = (1 + (x / xb2) ** (1.0 / s2)) ** ((alpha2 - alpha3) * s2)
-
-    return A * term1 * smooth1 * smooth2
-
-# # Combine all segments then filter to fit window
-all_t = np.concatenate([early_t, mid_t, late_t])
-all_y = np.concatenate([early_y, mid_y, late_y])
-all_e = np.concatenate([early_e, mid_e, late_e])
-
-fit_mask = (all_t >= -0.002) & (all_t <= 0.02)
-fit_t = all_t[fit_mask]
-fit_y = all_y[fit_mask]
-fit_e = all_e[fit_mask]
-
-try:
-    poptrev, pcovrev = curve_fit(
-        dsbpl, fit_t, fit_y,
-        p0=[5.0,7e-3,0.012,0.33,-0.5,-1.1], sigma=fit_e, absolute_sigma=True,
-        bounds=([0,6e-3,1e-2,0.1,-1,-2], [100,9e-3,0.015,0.5,0,-0.1]),
-        maxfev=10000,
-    )
-    perr = np.sqrt(np.diag(pcovrev))
-    fit_okrev = True
-    print(f"Power-law fit:  F0={poptrev[0]:.4f} xb1={poptrev[1]:.4f} xb2={poptrev[2]:.4f} a1={poptrev[3]:.4f} a2={poptrev[4]:.4f} a3={poptrev[5]:.4f}")
-except RuntimeError as exc:
-    print(f"Fit did not converge: {exc}")
-    fit_okrev = False
-# ── FS SBPL fit: data between -0.002 and 0.02 days ─────────────────────────────
-
-if fit_okrev:
-    def FS(x, A, xb1, xb2, alpha1, alpha2):
-        """
-        Multiplicative smoothly broken power law
-        """
-        alpha1=-alpha1
-        alpha2=-alpha2
-        rev = dsbpl(x, *poptrev)
-        alpha3=-(1-3*p)/4
-        s=0.02
-        s1=s
-        s2=s
-        x = np.asarray(x)
-    
-        term1 = (x / xb1) ** (-alpha1)
-    
-        smooth1 = (1 + (x / xb1) ** (1.0 / s1)) ** ((alpha1 - alpha2) * s1)
-        smooth2 = (1 + (x / xb2) ** (1.0 / s2)) ** ((alpha2 - alpha3) * s2)
-    
-        return (A * term1 * smooth1 * smooth2) + rev
-    
-    # # Combine all segments then filter to fit window
-    all_t = np.concatenate([early_t, mid_t, late_t])
-    all_y = np.concatenate([early_y, mid_y, late_y])
-    all_e = np.concatenate([early_e, mid_e, late_e])
-    
-    fit_mask = (all_t >= 0.02) & (all_t <= 2)
-    fit_t = all_t[fit_mask]
-    fit_y = all_y[fit_mask]
-    fit_e = all_e[fit_mask]
-    
-    try:
-        poptfwd, pcovfwd = curve_fit(
-            FS, fit_t, fit_y,
-            p0=[5.0,0.0325,0.049,1,0], sigma=fit_e, absolute_sigma=True,
-            bounds=([0,0.0,0.042,0.1,-1], [100,0.035,0.051,10,1]),
-            maxfev=10000,
-        )
-        perr = np.sqrt(np.diag(pcovfwd))
-        fit_okfwd = True
-        print(f"Power-law fit:  F0={poptfwd[0]:.4f} xb1={poptfwd[1]:.4f} xb2={poptfwd[2]:.4f} a1={poptfwd[3]:.4f} a2={poptfwd[4]:.4f} a3={(1-3*p)/4} (not fit)")
-    except RuntimeError as exc:
-        print(f"Fit did not converge: {exc}")
-        fit_okfwd = False
-else:
-    fit_okfwd = False
 
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
@@ -226,14 +127,6 @@ if fit_okwind:
     ax.plot(t_pl, winddecay(t_pl, *poptwind), color="navy", lw=2, zorder=5,ls='-.',
             label=rf"Wind")
 
-if fit_okrev:
-    t_pl = np.logspace(np.log10(1e-6), np.log10(3e-2), 2000)
-    ax.plot(t_pl, dsbpl(t_pl, *poptrev), color="black", lw=2, zorder=5,ls='-',
-            label=rf"SBPL")
-if fit_okfwd:
-    t_pl = np.logspace(np.log10(1e-6), np.log10(10), 2000)
-    ax.plot(t_pl, FS(t_pl, *poptfwd), color="black", lw=2, zorder=5,ls='-',
-            label=rf"FS+REV")
 # T_burst line
 ax.axvline(0, color="black",alpha=0.5, lw=1.5, ls="-", zorder=4, label=r"$T_{\rm burst}$")
 
@@ -244,10 +137,10 @@ ax.legend(fontsize=10, loc="upper right")
 ax.grid(True, which="both", ls=":", alpha=0.4)
 
 MIN_T = 0.01
-# ax.set_xscale("symlog", linthresh=MIN_T)
-ax.set_xscale("log")# , linthresh=MIN_T)
+ax.set_xscale("symlog", linthresh=MIN_T)
+# ax.set_xscale("log")# , linthresh=MIN_T)
 ax.set_yscale("log")
-ax.set_xlim(0, 10.0)
+ax.set_xlim(-1e-1, 10.0)
 ax.set_ylim(1e-2,7)
 ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
 
