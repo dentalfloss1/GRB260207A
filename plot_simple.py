@@ -18,21 +18,24 @@ def magtocts(mag):
 df = pd.read_csv('lc_GRB260207A_cand47734_cleaned', comment='#', sep=r'\s+',
     names=['BTJD','TJD','cts_per_s','e_cts_per_s','mag','e_mag',
            'bkg','bkg_model','bkg2','e_bkg2'])
-
+rawdata = np.genfromtxt("lc_GRB260207A_cand41148")
 rezero = np.median(df['cts_per_s'][((df['TJD'] - trigger) <(-2/24)) & ((df['TJD'] - trigger) > (-1))])
 
 
-fig,ax = plt.subplots(nrows=2,ncols=1, figsize=(15,10))
+fig,ax = plt.subplots(nrows=2,ncols=2, figsize=(15,10))
 masterT = Time("2026-02-07 05:44:56").jd - Time("2026-02-07 05:40:16.947").jd
 masterm = magtocts(17.3)
-ax[0].scatter(df['TJD']-trigger,df['cts_per_s']-rezero)
-ax[0].scatter(masterT,masterm,label="MASTER",marker='s')
-ax[0].set_title("TJD")
-ax[1].scatter(df['BTJD']-trigger_btjd,df['cts_per_s']-rezero)
-ax[1].scatter(masterT,masterm,label="MASTER",marker='s')
-ax[1].set_title("BTJD")
+ax[0,0].scatter(df['TJD']-trigger,df['cts_per_s']-rezero)
+ax[0,0].scatter(masterT,masterm,label="MASTER",marker='s')
+ax[0,0].set_title("TJD")
+ax[1,0].scatter(df['BTJD']-trigger_btjd,df['cts_per_s']-rezero)
+ax[1,0].scatter(masterT,masterm,label="MASTER",marker='s')
+ax[1,0].set_title("BTJD")
+ax[0,1].scatter(rawdata[:,0]-trigger,-rawdata[:,1]/(200*0.8*0.99))
+ax[0,1].scatter(masterT,masterm,label="MASTER",marker='s')
+ax[0,1].set_title("TJD")
 print(df['BTJD']-trigger_btjd)
-for a in ax:
+for a in ax.flatten():
 #     a.set_ylim(0,)
     a.set_xlim(-0.1,0.1)
     a.axvline(0)
