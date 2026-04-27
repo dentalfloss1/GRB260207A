@@ -186,7 +186,7 @@ if (straddle & pos).any():
     ax.errorbar(x_plot[straddle & pos], y_plot[straddle & pos],
                 yerr=ye_plot[straddle & pos],
                 fmt='D', color='tomato', markersize=6, elinewidth=0.6,
-                alpha=0.7, capsize=2, zorder=4, markerfacecolor='none',
+                alpha=1, capsize=2, zorder=4, markerfacecolor='none',
                 markeredgewidth=1.2,
                 label='Straddles T=0 (excl. from fit)')
 
@@ -196,7 +196,7 @@ if other_excl.any():
     ax.errorbar(x_plot[other_excl], y_plot[other_excl],
                 yerr=ye_plot[other_excl],
                 fmt='o', color='black', markersize=4, elinewidth=0.5,
-                alpha=0.5, capsize=2, zorder=3, markerfacecolor='none',
+                alpha=1, capsize=2, zorder=3, markerfacecolor='none',
                 label=f'Excl. from fit (t < {FIT_START*1440:.0f} min)')
 
 # Fitted data — filled black dots
@@ -247,4 +247,5 @@ ax.set_title('GRB260207A — cand41148', fontsize=12, pad=28)
 ax.legend(fontsize=8, loc='lower left')
 ax.grid(True, which='both', alpha=0.2, lw=0.5)
 plt.tight_layout()
-plt.show()
+plt.savefig("GRB260207A.png")
+plt.close()
