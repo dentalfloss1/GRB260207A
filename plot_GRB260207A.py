@@ -55,7 +55,7 @@ eF_master  = F_master * 0.30                  # 30% systematic
 # ---------------------------------------------------------------
 # Load and convert TESS data
 # ---------------------------------------------------------------
-rawdata  = np.loadtxt('lc_GRB260207A_cand41148')
+rawdata  = np.loadtxt('lc_GRB260207A_cand41148_geo')
 x_all    = rawdata[:, 0] - trigger_tjd
 y_all    = -rawdata[:, 1] / (200 * 0.8 * 0.99)   # cts/s
 yerr_all =  rawdata[:, 2] / (200 * 0.8 * 0.99)   # cts/s
