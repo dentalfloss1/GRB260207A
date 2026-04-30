@@ -239,7 +239,8 @@ if neg.any():
 # Straddle point — open red diamond
 if (straddle & pos).any():
     ax.errorbar(x_plot[straddle & pos], y_plot[straddle & pos],
-                yerr=ye_plot[straddle & pos],
+                yerr=[ye_plot[straddle & pos],
+                      ye_plot[straddle & pos]+(y_plot[straddle & pos]*((200/60/60/24)/((100/60/60/24)-x_plot[straddle & pos])) - y_plot[straddle & pos])],
                 fmt='D', color='tomato', markersize=6, elinewidth=0.6,
                 alpha=1, capsize=2, zorder=4, markerfacecolor='none',
                 markeredgewidth=1.2,
@@ -265,14 +266,14 @@ ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
             color='mediumseagreen', markersize=9, elinewidth=1.4,
             capsize=4, zorder=7, markeredgecolor='k', markeredgewidth=0.6,
             label=f'MASTER T+{t_master*1440:.1f} min\n'
-                   '(ref. only; Vega W-band; ~30% syst.)')
+                   '(ref. only; ~30% syst.)')
 
 # Model curves
 ax.plot(t_model, tot_m, '-', color='crimson', lw=2, zorder=6,
         label=f'Total (χ²_r={rc:.2f})')
 ax.plot(t_model, np.where(pk1_m>0, pk1_m, np.nan), '--', color='goldenrod',
         lw=1.8, zorder=5, label=f'P1 SBPL  tb={tb1*1440:.1f} min')
-ax.plot(t_model, np.where(pk2_m>0, pk2_m, np.nan), '--', color='steelblue',
+ax.plot(t_model, np.where(pk2_m>0, pk2_m, np.nan), ':', color='steelblue',
         lw=1.8, zorder=5, label=label_p2)
 
 # Break time markers
