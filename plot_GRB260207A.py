@@ -300,10 +300,45 @@ ax_min.set_xlabel('Minutes post-burst', fontsize=11)
 
 bin_str = 'unbinned' if UNBINNED else 'log-binned'
 dec_str = 'separate decay' if SEPARATE_DECAY else 'shared decay'
-ax.set_title(f'GRB260207A — cand41148  ({bin_str}, {dec_str})', fontsize=12, pad=28)
+ax.set_title(f'GRB260207A', fontsize=12, pad=28)
 ax.legend(fontsize=8, loc='lower left')
 ax.grid(True, which='both', alpha=0.2, lw=0.5)
 plt.tight_layout()
 suffix = ('_unbinned' if UNBINNED else '') + ('_sepdecay' if SEPARATE_DECAY else '')
 plt.savefig(f"GRB260207A{suffix}.png")
+plt.close()
+
+# ---------------------------------------------------------------
+# Radio plot (VLA; GRB260207A_-_Sheet1.csv)
+# Epoch (delta T) in days post-trigger; trigger offset ~2 min from
+# main trigger is negligible at the day timescale.
+# ---------------------------------------------------------------
+radio_t  = np.array([14.14183854, 22.9550353,  22.98706568])  # days
+radio_f  = np.array([24.0,        17.0,        18.0        ])  # uJy
+radio_e  = np.array([ 4.0,         3.0,         3.0        ])  # uJy
+radio_nu = np.array([ 6,          15,            6          ])  # GHz
+
+radio_e_tot = np.sqrt(radio_e**2 + (0.05 * radio_f)**2)
+
+mask_6  = radio_nu == 6
+mask_15 = radio_nu == 15
+
+fig2, ax2 = plt.subplots(figsize=(7, 5))
+
+ax2.errorbar(radio_t[mask_6],  radio_f[mask_6],  yerr=radio_e_tot[mask_6],
+             fmt='o', color='steelblue', markersize=7, elinewidth=1.2,
+             capsize=4, label='6 GHz (VLA)', zorder=3)
+ax2.errorbar(radio_t[mask_15], radio_f[mask_15], yerr=radio_e_tot[mask_15],
+             fmt='s', color='tomato', markersize=7, elinewidth=1.2,
+             capsize=4, label='15 GHz (VLA)', zorder=3)
+
+ax2.set_xscale('log')
+ax2.set_yscale('log')
+ax2.set_xlabel('Days post-burst', fontsize=12)
+ax2.set_ylabel(r'Flux density ($\mu$Jy)', fontsize=12)
+ax2.set_title('GRB260207A — Radio (VLA)', fontsize=12)
+ax2.legend(fontsize=10)
+ax2.grid(True, which='both', alpha=0.2, lw=0.5)
+plt.tight_layout()
+plt.savefig('GRB260207A_radio.png')
 plt.close()
