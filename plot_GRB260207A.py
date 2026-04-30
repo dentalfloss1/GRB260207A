@@ -32,10 +32,20 @@ Dependencies: numpy, matplotlib, scipy, astropy
 Input file:   lc_GRB260207A_cand41148
 """
 
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from astropy.time import Time
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--unbinned', action='store_true',
+                    help='Skip log-binning; plot and fit all data points')
+parser.add_argument('--separate_decay', action='store_true',
+                    help='Fit Peak 1 and Peak 2 decay indices independently')
+args = parser.parse_args()
+UNBINNED       = args.unbinned
+SEPARATE_DECAY = args.separate_decay
 
 # ---------------------------------------------------------------
 # Trigger time (non-barycentric)
@@ -78,16 +88,9 @@ y_plot_all  = flux_all[mask_plot]
 ye_plot_all = eflux_all[mask_plot]
 
 # ---------------------------------------------------------------
-# Log-binning from 0.03 days onwards (10 bins/decade)
+# Binning (or not)
 # ---------------------------------------------------------------
 BIN_START = 0.03
-
-x_e  = x_plot_all[x_plot_all <  BIN_START]
-y_e  = y_plot_all[x_plot_all <  BIN_START]
-ye_e = ye_plot_all[x_plot_all < BIN_START]
-x_l  = x_plot_all[x_plot_all >= BIN_START]
-y_l  = y_plot_all[x_plot_all >= BIN_START]
-ye_l = ye_plot_all[x_plot_all >= BIN_START]
 
 def log_bin(x, y, ye, bpd=10):
     edges = np.logspace(np.log10(x.min()), np.log10(x.max()),
@@ -100,14 +103,24 @@ def log_bin(x, y, ye, bpd=10):
         yeb.append(np.sqrt(np.sum(ye[m]**2)) / m.sum())
     return np.array(xb), np.array(yb), np.array(yeb)
 
-x_bin, y_bin, ye_bin = log_bin(x_l, y_l, ye_l)
-
-x_plot  = np.concatenate([x_e,   x_bin])
-y_plot  = np.concatenate([y_e,   y_bin])
-ye_plot = np.concatenate([ye_e,  ye_bin])
+if UNBINNED:
+    x_plot  = x_plot_all
+    y_plot  = y_plot_all
+    ye_plot = ye_plot_all
+else:
+    x_e  = x_plot_all[x_plot_all <  BIN_START]
+    y_e  = y_plot_all[x_plot_all <  BIN_START]
+    ye_e = ye_plot_all[x_plot_all < BIN_START]
+    x_l  = x_plot_all[x_plot_all >= BIN_START]
+    y_l  = y_plot_all[x_plot_all >= BIN_START]
+    ye_l = ye_plot_all[x_plot_all >= BIN_START]
+    x_bin, y_bin, ye_bin = log_bin(x_l, y_l, ye_l)
+    x_plot  = np.concatenate([x_e,   x_bin])
+    y_plot  = np.concatenate([y_e,   y_bin])
+    ye_plot = np.concatenate([ye_e,  ye_bin])
 
 # ---------------------------------------------------------------
-# Model: two SBPL with shared decay index, s=0.1
+# Model: two SBPL, s=0.1
 # Indices in decay-positive convention:
 #   negative alpha = rising, positive alpha = decaying
 # ---------------------------------------------------------------
@@ -118,9 +131,15 @@ def sbpl(t, F0, tb, a1, a2):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
 
 def F_total(t, F0, tb_1, a1_1, F1, tb_2, a1_2, alpha_decay):
-    """Joint model: Peak1 + Peak2, shared decay index."""
+    """Joint model: Peak1 + Peak2, shared decay index (7 params)."""
     pk1 = sbpl(t, F0, tb_1, a1_1, alpha_decay)
     pk2 = sbpl(t, F1, tb_2, a1_2, alpha_decay)
+    return np.where(pk1>0, pk1, 0) + np.where(pk2>0, pk2, 0)
+
+def F_total_separate(t, F0, tb_1, a1_1, a2_1, F1, tb_2, a1_2, a2_2):
+    """Joint model: Peak1 + Peak2, independent decay indices (8 params)."""
+    pk1 = sbpl(t, F0, tb_1, a1_1, a2_1)
+    pk2 = sbpl(t, F1, tb_2, a1_2, a2_2)
     return np.where(pk1>0, pk1, 0) + np.where(pk2>0, pk2, 0)
 
 # ---------------------------------------------------------------
@@ -134,39 +153,75 @@ FIT_START = 4e-3   # days
 mask_fit = (x_plot >= FIT_START) & (x_plot <= 1.0) & (ye_plot > 0)
 xf = x_plot[mask_fit]; yf = y_plot[mask_fit]; yef = ye_plot[mask_fit]
 
-#            F0      tb_1   a1_1    F1      tb_2    a1_2   alpha_decay
-p0        = [6e-4,  0.010, -0.5,   4e-4,  0.055,  -3.0,   1.0]
-bounds_lo = [0,     0.005, -3.0,   0,     0.030,  -8.0,   0.2]
-bounds_hi = [5e-3,  0.020,  0.0,   5e-3,  0.100,   0.0,   5.0]
+if SEPARATE_DECAY:
+    #               F0      tb_1   a1_1  a2_1    F1      tb_2    a1_2   a2_2
+    p0        = [6e-4,  0.010, -0.5,  1.0,   4e-4,  0.055,  -8.0,   1.0]
+    bounds_lo = [0,     0.005, -3.0,  0.2,   0,     0.030,  -20.0,   0.2]
+    bounds_hi = [5e-3,  0.020,  0.0,  5.0,   5e-3,  0.100,   0.0,   5.0]
+    r, pcov = curve_fit(F_total_separate, xf, yf, p0=p0,
+                        bounds=(bounds_lo, bounds_hi),
+                        sigma=yef, absolute_sigma=True, maxfev=500000)
+    e   = np.sqrt(np.diag(pcov))
+    rc  = np.sum(((yf - F_total_separate(xf, *r)) / yef)**2) / (len(xf) - len(r))
 
-r, pcov = curve_fit(F_total, xf, yf, p0=p0, bounds=(bounds_lo, bounds_hi),
-                    sigma=yef, absolute_sigma=True, maxfev=500000)
-e   = np.sqrt(np.diag(pcov))
-rc  = np.sum(((yf - F_total(xf, *r)) / yef)**2) / (len(xf) - len(r))
+    print(f"Trigger TJD:  {trigger_tjd:.6f}")
+    print(f"MASTER:       t={t_master*1440:.2f} min,  F={F_master*1e6:.0f} uJy (Vega)")
+    print(f"\nJOINT FIT (t >= {FIT_START*1440:.0f} min, two SBPL, separate decay, s={S}):")
+    print(f"  chi2_r     = {rc:.3f}  (N={len(xf)}, dof={len(xf)-len(r)})")
+    print(f"\nPeak 1 (SBPL):")
+    print(f"  F0         = {r[0]*1e6:.2f} +/- {e[0]*1e6:.2f} uJy")
+    print(f"  tb         = {r[1]*1440:.2f} +/- {e[1]*1440:.2f} min")
+    print(f"  a1 (rise)  = {r[2]:.3f} +/- {e[2]:.3f}")
+    print(f"  a2 (decay) = {r[3]:.3f} +/- {e[3]:.3f}")
+    print(f"  => p1 (ISM slow cooling) = {r[3]*4/3 + 1:.3f}")
+    print(f"\nPeak 2 (SBPL):")
+    print(f"  F0         = {r[4]*1e6:.2f} +/- {e[4]*1e6:.2f} uJy")
+    print(f"  tb         = {r[5]*1440:.2f} +/- {e[5]*1440:.2f} min")
+    print(f"  a1 (rise)  = {r[6]:.3f} +/- {e[6]:.3f}")
+    print(f"  a2 (decay) = {r[7]:.3f} +/- {e[7]:.3f}")
+    print(f"  => p2 (ISM slow cooling) = {r[7]*4/3 + 1:.3f}")
 
-print(f"Trigger TJD:  {trigger_tjd:.6f}")
-print(f"MASTER:       t={t_master*1440:.2f} min,  F={F_master*1e6:.0f} uJy (Vega)")
-print(f"\nJOINT FIT (t >= {FIT_START*1440:.0f} min, two SBPL, shared decay, s={S}):")
-print(f"  chi2_r     = {rc:.3f}  (N={len(xf)}, dof={len(xf)-len(r)})")
-print(f"\nPeak 1 (SBPL):")
-print(f"  F0         = {r[0]*1e6:.2f} +/- {e[0]*1e6:.2f} uJy")
-print(f"  tb         = {r[1]*1440:.2f} +/- {e[1]*1440:.2f} min")
-print(f"  a1 (rise)  = {r[2]:.3f} +/- {e[2]:.3f}")
-print(f"\nPeak 2 (SBPL):")
-print(f"  F0         = {r[3]*1e6:.2f} +/- {e[3]*1e6:.2f} uJy")
-print(f"  tb         = {r[4]*1440:.2f} +/- {e[4]*1440:.2f} min")
-print(f"  a1 (rise)  = {r[5]:.3f} +/- {e[5]:.3f}")
-print(f"\nShared decay:")
-print(f"  alpha      = {r[6]:.3f} +/- {e[6]:.3f}")
-print(f"  => p (ISM slow cooling) = {r[6]*4/3 + 1:.3f}")
+else:
+    #            F0      tb_1   a1_1    F1      tb_2    a1_2   alpha_decay
+    p0        = [6e-4,  0.010, -0.5,   4e-4,  0.055,  -3.0,   1.0]
+    bounds_lo = [0,     0.005, -3.0,   0,     0.030,  -8.0,   0.2]
+    bounds_hi = [5e-3,  0.020,  0.0,   5e-3,  0.100,   0.0,   5.0]
+    r, pcov = curve_fit(F_total, xf, yf, p0=p0, bounds=(bounds_lo, bounds_hi),
+                        sigma=yef, absolute_sigma=True, maxfev=500000)
+    e   = np.sqrt(np.diag(pcov))
+    rc  = np.sum(((yf - F_total(xf, *r)) / yef)**2) / (len(xf) - len(r))
+
+    print(f"Trigger TJD:  {trigger_tjd:.6f}")
+    print(f"MASTER:       t={t_master*1440:.2f} min,  F={F_master*1e6:.0f} uJy (Vega)")
+    print(f"\nJOINT FIT (t >= {FIT_START*1440:.0f} min, two SBPL, shared decay, s={S}):")
+    print(f"  chi2_r     = {rc:.3f}  (N={len(xf)}, dof={len(xf)-len(r)})")
+    print(f"\nPeak 1 (SBPL):")
+    print(f"  F0         = {r[0]*1e6:.2f} +/- {e[0]*1e6:.2f} uJy")
+    print(f"  tb         = {r[1]*1440:.2f} +/- {e[1]*1440:.2f} min")
+    print(f"  a1 (rise)  = {r[2]:.3f} +/- {e[2]:.3f}")
+    print(f"\nPeak 2 (SBPL):")
+    print(f"  F0         = {r[3]*1e6:.2f} +/- {e[3]*1e6:.2f} uJy")
+    print(f"  tb         = {r[4]*1440:.2f} +/- {e[4]*1440:.2f} min")
+    print(f"  a1 (rise)  = {r[5]:.3f} +/- {e[5]:.3f}")
+    print(f"\nShared decay:")
+    print(f"  alpha      = {r[6]:.3f} +/- {e[6]:.3f}")
+    print(f"  => p (ISM slow cooling) = {r[6]*4/3 + 1:.3f}")
 
 # ---------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------
 t_model = np.logspace(np.log10(x_plot[x_plot>0].min()*0.9), np.log10(1.0), 2000)
-pk1_m   = sbpl(t_model, r[0], r[1], r[2], r[6])
-pk2_m   = sbpl(t_model, r[3], r[4], r[5], r[6])
-tot_m   = np.where(pk1_m>0, pk1_m, 0) + np.where(pk2_m>0, pk2_m, 0)
+if SEPARATE_DECAY:
+    pk1_m    = sbpl(t_model, r[0], r[1], r[2], r[3])
+    pk2_m    = sbpl(t_model, r[4], r[5], r[6], r[7])
+    tb1, tb2 = r[1], r[5]
+    label_p2 = f'P2 SBPL  tb={tb2*1440:.1f} min  |  α₁={r[3]:.2f}, α₂={r[7]:.2f} (sep.)'
+else:
+    pk1_m    = sbpl(t_model, r[0], r[1], r[2], r[6])
+    pk2_m    = sbpl(t_model, r[3], r[4], r[5], r[6])
+    tb1, tb2 = r[1], r[4]
+    label_p2 = f'P2 SBPL  tb={tb2*1440:.1f} min  |  α={r[6]:.2f} (shared)'
+tot_m = np.where(pk1_m>0, pk1_m, 0) + np.where(pk2_m>0, pk2_m, 0)
 
 fig, ax = plt.subplots(figsize=(9, 6))
 
@@ -216,14 +271,13 @@ ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
 ax.plot(t_model, tot_m, '-', color='crimson', lw=2, zorder=6,
         label=f'Total (χ²_r={rc:.2f})')
 ax.plot(t_model, np.where(pk1_m>0, pk1_m, np.nan), '--', color='goldenrod',
-        lw=1.8, zorder=5, label=f'P1 SBPL  tb={r[1]*1440:.1f} min')
+        lw=1.8, zorder=5, label=f'P1 SBPL  tb={tb1*1440:.1f} min')
 ax.plot(t_model, np.where(pk2_m>0, pk2_m, np.nan), '--', color='steelblue',
-        lw=1.8, zorder=5,
-        label=f'P2 SBPL  tb={r[4]*1440:.1f} min  |  α={r[6]:.2f} (shared)')
+        lw=1.8, zorder=5, label=label_p2)
 
 # Break time markers
-ax.axvline(r[1], color='goldenrod', lw=0.8, ls=':', alpha=0.6)
-ax.axvline(r[4], color='steelblue', lw=0.8, ls=':', alpha=0.6)
+ax.axvline(tb1, color='goldenrod', lw=0.8, ls=':', alpha=0.6)
+ax.axvline(tb2, color='steelblue', lw=0.8, ls=':', alpha=0.6)
 ax.axvline(FIT_START, color='gray', lw=0.8, ls='--', alpha=0.4)
 
 ax.set_xscale('log'); ax.set_yscale('log')
@@ -243,9 +297,12 @@ ax_min.set_xticks([m/1440. for m in min_ticks])
 ax_min.set_xticklabels([str(m) for m in min_ticks], fontsize=8)
 ax_min.set_xlabel('Minutes post-burst', fontsize=11)
 
-ax.set_title('GRB260207A — cand41148', fontsize=12, pad=28)
+bin_str = 'unbinned' if UNBINNED else 'log-binned'
+dec_str = 'separate decay' if SEPARATE_DECAY else 'shared decay'
+ax.set_title(f'GRB260207A — cand41148  ({bin_str}, {dec_str})', fontsize=12, pad=28)
 ax.legend(fontsize=8, loc='lower left')
 ax.grid(True, which='both', alpha=0.2, lw=0.5)
 plt.tight_layout()
-plt.savefig("GRB260207A.png")
+suffix = ('_unbinned' if UNBINNED else '') + ('_sepdecay' if SEPARATE_DECAY else '')
+plt.savefig(f"GRB260207A{suffix}.png")
 plt.close()
