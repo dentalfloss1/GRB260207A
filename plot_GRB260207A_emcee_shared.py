@@ -135,7 +135,7 @@ def log_probability(theta, x, y, yerr):
 # ---------------------------------------------------------------
 # Run emcee for one dataset
 # ---------------------------------------------------------------
-def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=400, nprod=800):
+def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=1000, nprod=100_000):
     ndim = len(theta0)
     # Initialize walkers in tight ball around theta0
     pos = theta0 + 1e-3 * np.random.randn(nwalkers, ndim)
@@ -324,6 +324,19 @@ plt.close()
 print("\nSaved: GRB260207A_emcee_compare_shared.png")
 
 # ---------------------------------------------------------------
+# Single-panel Fit B only plot
+# ---------------------------------------------------------------
+fig_b, ax_b = plt.subplots(figsize=(8, 6.5))
+plot_fit(ax_b, samplerB, mask_B,
+         f'Fit B: t in (0, 0.1 d]   (N={len(xB)})', chi2_rB)
+ax_b.set_ylabel('Flux density (Jy)', fontsize=11)
+plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
+plt.tight_layout()
+plt.savefig('GRB260207A_emcee_fitB_shared.png', dpi=130, bbox_inches='tight')
+plt.close()
+print("Saved: GRB260207A_emcee_fitB_shared.png")
+
+# ---------------------------------------------------------------
 # Save corner plot for Fit B (the more interesting one)
 # ---------------------------------------------------------------
 try:
@@ -334,14 +347,16 @@ try:
     samples_phys_B[:, 1] = 10**samples_phys_B[:, 1] * 1440  # tb_1 min
     samples_phys_B[:, 3] = 10**samples_phys_B[:, 3] * 1e6   # F0_2 uJy
     samples_phys_B[:, 4] = 10**samples_phys_B[:, 4] * 1440  # tb_2 min
-    fig_c = corner.corner(
-        samples_phys_B,
-        labels=['F0_1 (uJy)', 'tb_1 (min)', 'α₁_1',
-                'F0_2 (uJy)', 'tb_2 (min)', 'α₁_2', 'α₂ (shared)'],
-        quantiles=[0.16, 0.5, 0.84], show_titles=True,
-        title_fmt='.2f', label_kwargs={'fontsize': 10})
-    fig_c.savefig('GRB260207A_corner_B_shared.png', dpi=110)
-    plt.close(fig_c)
+    with plt.rc_context({'text.usetex': True}):
+        fig_c = corner.corner(
+            samples_phys_B,
+            labels=[r'$F_{0,1}$ ($\mu$Jy)', r'$t_{\rm break,1}$ (min)', r'$\alpha_{1,1}$',
+                    r'$F_{0,2}$ ($\mu$Jy)', r'$t_{\rm break,2}$ (min)', r'$\alpha_{1,2}$',
+                    r'$\alpha_{2,\rm shared}$'],
+            quantiles=[0.16, 0.5, 0.84], show_titles=True,
+            title_fmt='.2f', label_kwargs={'fontsize': 10})
+        fig_c.savefig('GRB260207A_corner_B_shared.png', dpi=110)
+        plt.close(fig_c)
     print("Saved: GRB260207A_corner_B_shared.png")
 except ImportError:
     print("corner not available, skipping corner plot")
