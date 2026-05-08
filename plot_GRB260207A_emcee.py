@@ -1,9 +1,8 @@
 """
 GRB260207A — emcee fit of P1-SBPL + P2-DSBPL model.
 
-Two fits, same model (P1: SBPL; P2: double SBPL), window-integrated forward model.
-  Fit A: t in [5 min, 1 day]   (excludes straddle and very early points)
-  Fit B: t in (0, 0.1 d]       (includes straddle, excludes noisy late times)
+Fit B: t in (0, 0.1 d]  (includes straddle, excludes noisy late times)
+P1 rise and decay indices are fixed; only P2 and P1 amplitude/break are free.
 
 Priors:
   log_uniform on F0_1, F0_2           (wide range across decades)
@@ -11,8 +10,12 @@ Priors:
   uniform on alpha indices
   ordering: tb2a_2 < tb2b_2 enforced
 
+Fixed parameters:
+  a1_1 = -0.5  (P1 rise: F ~ t^+0.5)
+  a2_1 =  1.0  (P1 decay: F ~ t^-1)
+
 Sampled parameters:
-  theta = [log10(F0_1), log10(tb_1), a1_1, a2_1,
+  theta = [log10(F0_1), log10(tb_1),
            log10(F0_2), log10(tb2a_2), log10(tb2b_2), a1_2, a2_2, a3_2]
 """
 
@@ -92,24 +95,28 @@ def model_2sbpl_windowed(t_arr, *params):
     return out
 
 # ---------------------------------------------------------------
+# Fixed P1 indices
+# ---------------------------------------------------------------
+A1_1_FIXED = -0.5   # P1 rise: F ~ t^+0.5
+A2_1_FIXED =  1.0   # P1 decay: F ~ t^-1
+
+# ---------------------------------------------------------------
 # Priors
-# theta = [logF1, logTb1, a1_1, a2_1,
+# theta = [logF1, logTb1,
 #          logF2, logTb2a, logTb2b, a1_2, a2_2, a3_2]
 # ---------------------------------------------------------------
 # Log-uniform priors:
 #   F0 in [1e-6, 5e-3] Jy   -> log10 in [-6, -2.3]
 #   tb in [1e-4, 1e-1] d    -> log10 in [-4, -1]   (0.14 min to 144 min)
 # Uniform priors:
-#   a1 (rise) in [-50, 0]
-#   a2_1, a3_2 (decay) in [0.2, 5]
+#   a1_2 (rise) in [-50, 0]
+#   a3_2 (decay) in [0.2, 5]
 #   a2_2 (P2 middle, approx flat) in [-2, 3]
 # Ordering: tb2a_2 < tb2b_2 enforced in log_prior
 
 PRIOR_RANGES = {
     'logF1':   (-6.0, -2.3),
     'logTb1':  (-4.0, -1.0),
-    'a1_1':    (-50.0, 0.0),
-    'a2_1':    (0.2, 5.0),
     'logF2':   (-6.0, -2.3),
     'logTb2a': (-4.0, -1.0),
     'logTb2b': (-4.0, -1.0),
@@ -124,14 +131,14 @@ def log_prior(theta):
         if not (lo <= v <= hi):
             return -np.inf
     # Require first P2 break before second
-    if theta[6] <= theta[5]:
+    if theta[4] <= theta[3]:
         return -np.inf
     return 0.0
 
 def theta_to_params(theta):
     """Convert sampled theta (log10 for F and tb) to physical parameters."""
-    logF1, logTb1, a1_1, a2_1, logF2, logTb2a, logTb2b, a1_2, a2_2, a3_2 = theta
-    return (10**logF1, 10**logTb1, a1_1, a2_1,
+    logF1, logTb1, logF2, logTb2a, logTb2b, a1_2, a2_2, a3_2 = theta
+    return (10**logF1, 10**logTb1, A1_1_FIXED, A2_1_FIXED,
             10**logF2, 10**logTb2a, 10**logTb2b, a1_2, a2_2, a3_2)
 
 def log_likelihood(theta, x, y, yerr):
@@ -186,30 +193,23 @@ def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=500, nprod=10_000):
     return sampler
 
 # ---------------------------------------------------------------
-# Set up datasets
+# Set up dataset — Fit B: 0 to 0.1 d
 # ---------------------------------------------------------------
-# Fit A: 0 min to 1 day
-mask_A = ((x_plot >= 0/1440) & (x_plot <= 1.0) & (ye_plot > 0))
-xA = x_plot[mask_A]; yA = y_plot[mask_A]; yeA = ye_plot[mask_A]
-
-# Fit B: 0 to 0.1 d
 mask_B = ((x_plot > 0) & (x_plot <= 0.1) & (ye_plot > 0))
 xB = x_plot[mask_B]; yB = y_plot[mask_B]; yeB = ye_plot[mask_B]
 
-print(f"Fit A: N = {len(xA)},  t in [{xA.min()*1440:.2f}, {xA.max():.3f} d]")
 print(f"Fit B: N = {len(xB)},  t in [{xB.min()*1440:.2f}, {xB.max():.3f} d]")
 
 # Initial point informed by previous fits:
-#   Peak 1: F0 ~ 700 uJy, tb ~ 10 min, a1 ~ -2, a2 ~ 1
+#   Peak 1: F0 ~ 700 uJy, tb ~ 10 min  (a1_1, a2_1 fixed)
 #   Peak 2: F0 ~ 300 uJy, tb2a ~ 45 min, tb2b ~ 75 min, a1 ~ -10, a2 ~ 0, a3 ~ 2
 theta0 = [
-    np.log10(7e-4),  np.log10(10/1440), -2.0, 1.0,
+    np.log10(7e-4),  np.log10(10/1440),
     np.log10(3e-4),  np.log10(45/1440), np.log10(75/1440), -10.0, 0.0, 2.0,
 ]
 
 np.random.seed(42)
 
-samplerA = run_emcee(xA, yA, yeA, theta0, 'Fit A')
 samplerB = run_emcee(xB, yB, yeB, theta0, 'Fit B')
 
 # ---------------------------------------------------------------
@@ -233,27 +233,20 @@ def summarize(sampler, label):
         quantiles.append((name, q16, q50, q84))
     return theta_best, params_best, quantiles, samples, log_prob
 
-bestA, paramsA, qA, samplesA, logprobA = summarize(samplerA, 'Fit A')
 bestB, paramsB, qB, samplesB, logprobB = summarize(samplerB, 'Fit B')
 
 # chi^2
-chi2A = -2 * np.max(logprobA)
-chi2_rA = chi2A / (len(xA) - 10)
 chi2B = -2 * np.max(logprobB)
-chi2_rB = chi2B / (len(xB) - 10)
+chi2_rB = chi2B / (len(xB) - 8)
 
 # Display
-print(f"\n=== FIT A SUMMARY (t >= 0 min, t <= 1 d, N={len(xA)}) ===")
-print(f"  Best chi2_r = {chi2_rA:.3f}")
-labels_phys = ['F0_1 (uJy)', 'tb_1 (min)', 'a1_1', 'a2_1',
-               'F0_2 (uJy)', 'tb2a_2 (min)', 'tb2b_2 (min)', 'a1_2', 'a2_2', 'a3_2']
-scale = [1e6, 1440, 1, 1, 1e6, 1440, 1440, 1, 1, 1]
-for (name, q16, q50, q84), lbl, sc, p in zip(qA, labels_phys, scale, paramsA):
-    print(f"  {lbl:>14s}:  median={q50*sc:8.2f}  +{(q84-q50)*sc:6.2f} -{(q50-q16)*sc:6.2f}  best={p*sc:8.2f}")
-
 print(f"\n=== FIT B SUMMARY (t > 0, t <= 0.1 d, N={len(xB)}) ===")
+print(f"  Fixed: a1_1={A1_1_FIXED}, a2_1={A2_1_FIXED}")
 print(f"  Best chi2_r = {chi2_rB:.3f}")
-for (name, q16, q50, q84), lbl, sc, p in zip(qB, labels_phys, scale, paramsB):
+labels_phys = ['F0_1 (uJy)', 'tb_1 (min)',
+               'F0_2 (uJy)', 'tb2a_2 (min)', 'tb2b_2 (min)', 'a1_2', 'a2_2', 'a3_2']
+scale = [1e6, 1440, 1e6, 1440, 1440, 1, 1, 1]
+for (name, q16, q50, q84), lbl, sc, p in zip(qB, labels_phys, scale, paramsB[:2] + paramsB[4:]):
     print(f"  {lbl:>14s}:  median={q50*sc:8.2f}  +{(q84-q50)*sc:6.2f} -{(q50-q16)*sc:6.2f}  best={p*sc:8.2f}")
 
 # ---------------------------------------------------------------
@@ -329,23 +322,6 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
     ax_min.set_xticklabels([str(m) for m in min_ticks], fontsize=8)
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
-fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), sharey=True)
-plot_fit(axes[0], samplerA, mask_A,
-         f'Fit A: t in [5 min, 1 d]   (N={len(xA)})', chi2_rA)
-plot_fit(axes[1], samplerB, mask_B,
-         f'Fit B: t in (0, 0.1 d]   (N={len(xB)})', chi2_rB)
-axes[0].set_ylabel('Flux density (Jy)', fontsize=11)
-
-plt.suptitle('GRB260207A — emcee 2-SBPL fits (log priors on F, tb)',
-             fontsize=12, y=0.98)
-plt.tight_layout()
-plt.savefig('GRB260207A_emcee_compare.png', dpi=130, bbox_inches='tight')
-plt.close()
-print("\nSaved: GRB260207A_emcee_compare.png")
-
-# ---------------------------------------------------------------
-# Single-panel Fit B only plot
-# ---------------------------------------------------------------
 fig_b, ax_b = plt.subplots(figsize=(8, 6.5))
 plot_fit(ax_b, samplerB, mask_B,
          f'Fit B: t in (0, 0.1 d]   (N={len(xB)})', chi2_rB)
@@ -354,7 +330,7 @@ plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
 plt.tight_layout()
 plt.savefig('GRB260207A_emcee_fitB.png', dpi=130, bbox_inches='tight')
 plt.close()
-print("Saved: GRB260207A_emcee_fitB.png")
+print("\nSaved: GRB260207A_emcee_fitB.png")
 
 # ---------------------------------------------------------------
 # Save corner plot for Fit B (the more interesting one)
@@ -362,17 +338,16 @@ print("Saved: GRB260207A_emcee_fitB.png")
 try:
     import corner
     samples_phys_B = samplesB.copy()
-    # Convert log10 columns to physical (F0 in uJy, tb in min)
+    # theta = [logF1, logTb1, logF2, logTb2a, logTb2b, a1_2, a2_2, a3_2]
     samples_phys_B[:, 0] = 10**samples_phys_B[:, 0] * 1e6   # F0_1 uJy
     samples_phys_B[:, 1] = 10**samples_phys_B[:, 1] * 1440  # tb_1 min
-    samples_phys_B[:, 4] = 10**samples_phys_B[:, 4] * 1e6   # F0_2 uJy
-    samples_phys_B[:, 5] = 10**samples_phys_B[:, 5] * 1440  # tb2a_2 min
-    samples_phys_B[:, 6] = 10**samples_phys_B[:, 6] * 1440  # tb2b_2 min
+    samples_phys_B[:, 2] = 10**samples_phys_B[:, 2] * 1e6   # F0_2 uJy
+    samples_phys_B[:, 3] = 10**samples_phys_B[:, 3] * 1440  # tb2a_2 min
+    samples_phys_B[:, 4] = 10**samples_phys_B[:, 4] * 1440  # tb2b_2 min
     with plt.rc_context({'text.usetex': True}):
         fig_c = corner.corner(
             samples_phys_B,
             labels=[r'$F_{0,1}$ ($\mu$Jy)', r'$t_{\rm b,1}$ (min)',
-                    r'$\alpha_{1,1}$', r'$\alpha_{2,1}$',
                     r'$F_{0,2}$ ($\mu$Jy)', r'$t_{\rm b1,2}$ (min)', r'$t_{\rm b2,2}$ (min)',
                     r'$\alpha_{1,2}$', r'$\alpha_{2,2}$', r'$\alpha_{3,2}$'],
             quantiles=[0.16, 0.5, 0.84], show_titles=True,
