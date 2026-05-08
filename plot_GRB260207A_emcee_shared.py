@@ -1,18 +1,20 @@
 """
-GRB260207A — emcee fit of 2-SBPL model.
+GRB260207A — emcee fit of P1-SBPL + P2-DSBPL model, shared final decay.
 
-Two fits, same model (2 SBPLs, separate decays), window-integrated forward model.
+Two fits, same model (P1: SBPL; P2: double SBPL, final decay shared with P1).
   Fit A: t in [5 min, 1 day]   (excludes straddle and very early points)
   Fit B: t in (0, 0.1 d]       (includes straddle, excludes noisy late times)
 
 Priors:
-  log_uniform on F0_1, F0_2  (wide range across decades)
-  log_uniform on tb_1, tb_2  (covers all reasonable break times)
+  log_uniform on F0_1, F0_2           (wide range across decades)
+  log_uniform on tb_1, tb2a_2, tb2b_2 (covers all reasonable break times)
   uniform on alpha indices
+  ordering: tb2a_2 < tb2b_2 enforced
 
 Sampled parameters:
-  theta = [log10(F0_1), log10(tb_1), a1_1, a2_1,
-           log10(F0_2), log10(tb_2), a1_2, a2_2]
+  theta = [log10(F0_1), log10(tb_1), a1_1,
+           log10(F0_2), log10(tb2a_2), log10(tb2b_2), a1_2, a2_2,
+           a2_shared]   <- shared final decay (P1 decay = P2 a3)
 """
 
 import numpy as np
@@ -52,11 +54,17 @@ S = 0.1
 def sbpl(t, F0, tb, a1, a2, S=S):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
 
-def model_2sbpl(t, F0_1, tb_1, a1_1,
-                   F0_2, tb_2, a1_2, a2_shared):
-    """Two SBPLs with a SHARED decay slope a2."""
-    p1 = sbpl(t, F0_1, tb_1, a1_1, a2_shared)
-    p2 = sbpl(t, F0_2, tb_2, a1_2, a2_shared)
+def dsbpl(t, F0, tb1, tb2, a1, a2, a3, S=S):
+    """Double SBPL: breaks at tb1 (a1->a2) and tb2 (a2->a3)."""
+    f1 = (0.5 * (1 + (t/tb1)**(1/S)))**(-(a2-a1)*S)
+    f2 = (0.5 * (1 + (t/tb2)**(1/S)))**(-(a3-a2)*S)
+    return F0 * (t/tb1)**(-a1) * f1 * f2
+
+def model_2sbpl(t, F0_1, tb_1, a1_1, a2_1,
+                   F0_2, tb2a_2, tb2b_2, a1_2, a2_2, a3_2):
+    """P1: SBPL; P2: DSBPL. a2_1 = a3_2 = shared final decay."""
+    p1 = sbpl(t, F0_1, tb_1, a1_1, a2_1)
+    p2 = dsbpl(t, F0_2, tb2a_2, tb2b_2, a1_2, a2_2, a3_2)
     return np.where(p1 > 0, p1, 0) + np.where(p2 > 0, p2, 0)
 
 HALF_WIN_DAY = CADENCE / 2.0
@@ -87,15 +95,19 @@ def model_2sbpl_windowed(t_arr, *params):
 
 # ---------------------------------------------------------------
 # Priors
-# theta = [logF1, logTb1, a1_1, logF2, logTb2, a1_2, a2_shared]
+# theta = [logF1, logTb1, a1_1,
+#          logF2, logTb2a, logTb2b, a1_2, a2_2,
+#          a2_shared]
 # ---------------------------------------------------------------
 PRIOR_RANGES = {
     'logF1':     (-6.0, -2.3),
     'logTb1':    (-4.0, -1.0),
     'a1_1':      (-50.0, 0.0),
     'logF2':     (-6.0, -2.3),
-    'logTb2':    (-4.0, -1.0),
+    'logTb2a':   (-4.0, -1.0),
+    'logTb2b':   (-4.0, -1.0),
     'a1_2':      (-50.0, 0.0),
+    'a2_2':      (-2.0, 3.0),
     'a2_shared': (0.2, 5.0),
 }
 PARAM_NAMES = list(PRIOR_RANGES.keys())
@@ -104,14 +116,18 @@ def log_prior(theta):
     for v, (lo, hi) in zip(theta, PRIOR_RANGES.values()):
         if not (lo <= v <= hi):
             return -np.inf
-    return 0.0   # log-uniform = uniform on log values; flat in linear=>log-flat
+    # Require first P2 break before second
+    if theta[5] <= theta[4]:
+        return -np.inf
+    return 0.0
 
 def theta_to_params(theta):
     """Convert sampled theta (log10 for F and tb) to physical parameters.
-    Returns 7 values: F0_1, tb_1, a1_1, F0_2, tb_2, a1_2, a2_shared"""
-    logF1, logTb1, a1_1, logF2, logTb2, a1_2, a2_shared = theta
-    return (10**logF1, 10**logTb1, a1_1,
-            10**logF2, 10**logTb2, a1_2, a2_shared)
+    Returns 10 values: F0_1, tb_1, a1_1, a2_shared,
+                       F0_2, tb2a_2, tb2b_2, a1_2, a2_2, a2_shared"""
+    logF1, logTb1, a1_1, logF2, logTb2a, logTb2b, a1_2, a2_2, a2_shared = theta
+    return (10**logF1, 10**logTb1, a1_1, a2_shared,
+            10**logF2, 10**logTb2a, 10**logTb2b, a1_2, a2_2, a2_shared)
 
 def log_likelihood(theta, x, y, yerr):
     params = theta_to_params(theta)
@@ -135,7 +151,7 @@ def log_probability(theta, x, y, yerr):
 # ---------------------------------------------------------------
 # Run emcee for one dataset
 # ---------------------------------------------------------------
-def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=1000, nprod=100_000):
+def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=500, nprod=10_000):
     ndim = len(theta0)
     # Initialize walkers in tight ball around theta0
     pos = theta0 + 1e-3 * np.random.randn(nwalkers, ndim)
@@ -167,24 +183,25 @@ def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=1000, nprod=100_000)
 # ---------------------------------------------------------------
 # Set up datasets
 # ---------------------------------------------------------------
-# Fit A: 5 min to 1 day
-mask_A = ((x_plot >= 5.0/1440) & (x_plot <= 1.0) & (ye_plot > 0))
+# Fit A: 0 min to 1 day
+mask_A = ((x_plot >= 0) & (x_plot <= 1.0) & (ye_plot > 0))
 xA = x_plot[mask_A]; yA = y_plot[mask_A]; yeA = ye_plot[mask_A]
 
 # Fit B: 0 to 0.1 d
-mask_B = ((x_plot > 0) & (x_plot <= 0.1) & (ye_plot > 0))
+mask_B = ((x_plot > 0) & (x_plot <= 1.0) & (ye_plot > 0))
 xB = x_plot[mask_B]; yB = y_plot[mask_B]; yeB = ye_plot[mask_B]
 
 print(f"Fit A: N = {len(xA)},  t in [{xA.min()*1440:.2f}, {xA.max():.3f} d]")
 print(f"Fit B: N = {len(xB)},  t in [{xB.min()*1440:.2f}, {xB.max():.3f} d]")
 
 # Initial point informed by previous fits:
-#   Peak 1: F0 ~ 700 uJy, tb ~ 10 min, a1 ~ -2, a2 ~ 1
-#   Peak 2: F0 ~ 300 uJy, tb ~ 45 min, a1 ~ -8, a2 ~ 1.5
+#   Peak 1: F0 ~ 700 uJy, tb ~ 10 min, a1 ~ -2
+#   Peak 2: F0 ~ 300 uJy, tb2a ~ 45 min, tb2b ~ 75 min, a1 ~ -10, a2 ~ 0
+#   Shared final decay ~ 1.3
 theta0 = [
     np.log10(7e-4),  np.log10(10/1440), -2.0,
-    np.log10(3e-4),  np.log10(45/1440), -8.0,
-    1.3,   # shared decay, between previous A=0.63/2.10 and B=1.08/1.56
+    np.log10(3e-4),  np.log10(45/1440), np.log10(75/1440), -10.0, 0.0,
+    1.3,   # shared final decay (P1 a2 = P2 a3)
 ]
 
 np.random.seed(42)
@@ -218,22 +235,27 @@ bestB, paramsB, qB, samplesB, logprobB = summarize(samplerB, 'Fit B')
 
 # chi^2
 chi2A = -2 * np.max(logprobA)
-chi2_rA = chi2A / (len(xA) - 7)
+chi2_rA = chi2A / (len(xA) - 9)
 chi2B = -2 * np.max(logprobB)
-chi2_rB = chi2B / (len(xB) - 7)
+chi2_rB = chi2B / (len(xB) - 9)
 
 # Display
-print(f"\n=== FIT A SUMMARY (t >= 5 min, t <= 1 d, N={len(xA)}) ===")
+print(f"\n=== FIT A SUMMARY (t >= 0 min, t <= 1 d, N={len(xA)}) ===")
 print(f"  Best chi2_r = {chi2_rA:.3f}")
 labels_phys = ['F0_1 (uJy)', 'tb_1 (min)', 'a1_1',
-               'F0_2 (uJy)', 'tb_2 (min)', 'a1_2', 'a2_shared']
-scale = [1e6, 1440, 1, 1e6, 1440, 1, 1]
-for (name, q16, q50, q84), lbl, sc, p in zip(qA, labels_phys, scale, paramsA):
+               'F0_2 (uJy)', 'tb2a_2 (min)', 'tb2b_2 (min)', 'a1_2', 'a2_2', 'a2_shared']
+scale = [1e6, 1440, 1, 1e6, 1440, 1440, 1, 1, 1]
+# paramsA/B have 10 values: (F0_1,tb_1,a1_1,a2sh, F0_2,tb2a,tb2b,a1_2,a2_2,a2sh)
+# Skip index 3 (duplicate a2_shared at P1 position); select [0,1,2,4,5,6,7,8,9]
+_idx = [0, 1, 2, 4, 5, 6, 7, 8, 9]
+for (name, q16, q50, q84), lbl, sc, p in zip(qA, labels_phys, scale,
+                                               [paramsA[i] for i in _idx]):
     print(f"  {lbl:>14s}:  median={q50*sc:8.2f}  +{(q84-q50)*sc:6.2f} -{(q50-q16)*sc:6.2f}  best={p*sc:8.2f}")
 
 print(f"\n=== FIT B SUMMARY (t > 0, t <= 0.1 d, N={len(xB)}) ===")
 print(f"  Best chi2_r = {chi2_rB:.3f}")
-for (name, q16, q50, q84), lbl, sc, p in zip(qB, labels_phys, scale, paramsB):
+for (name, q16, q50, q84), lbl, sc, p in zip(qB, labels_phys, scale,
+                                               [paramsB[i] for i in _idx]):
     print(f"  {lbl:>14s}:  median={q50*sc:8.2f}  +{(q84-q50)*sc:6.2f} -{(q50-q16)*sc:6.2f}  best={p*sc:8.2f}")
 
 # ---------------------------------------------------------------
@@ -276,22 +298,22 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
         ymod = model_2sbpl(t_model, *params)
         ax.plot(t_model, ymod, '-', color='crimson', lw=0.3, alpha=0.04, zorder=4)
 
-    # Best fit
+    # Best fit — params_best: (F0_1,tb_1,a1_1,a2sh, F0_2,tb2a,tb2b,a1_2,a2_2,a2sh)
     ymod_best = model_2sbpl(t_model, *params_best)
     p1_best = sbpl(t_model, params_best[0], params_best[1],
-                   params_best[2], params_best[6])
-    p2_best = sbpl(t_model, params_best[3], params_best[4],
-                   params_best[5], params_best[6])
+                   params_best[2], params_best[3])
+    p2_best = dsbpl(t_model, params_best[4], params_best[5], params_best[6],
+                    params_best[7], params_best[8], params_best[9])
     ax.plot(t_model, ymod_best, '-', color='crimson', lw=2.0, zorder=6,
             label=f'Best fit (χ²_r={chi2_r:.2f})')
     ax.plot(t_model, np.where(p1_best>0, p1_best, np.nan), '--',
             color='goldenrod', lw=1.4, zorder=5,
             label=f'P1 tb={params_best[1]*1440:.1f} min'
-                  f'  α=({params_best[2]:.2f},{params_best[6]:.2f})')
+                  f'  α=({params_best[2]:.2f},{params_best[3]:.2f})')
     ax.plot(t_model, np.where(p2_best>0, p2_best, np.nan), ':',
             color='steelblue', lw=1.6, zorder=5,
-            label=f'P2 tb={params_best[4]*1440:.1f} min'
-                  f'  α=({params_best[5]:.2f},{params_best[6]:.2f})')
+            label=f'P2 tb=({params_best[5]*1440:.1f},{params_best[6]*1440:.1f}) min'
+                  f'  α=({params_best[7]:.2f},{params_best[8]:.2f},{params_best[9]:.2f})')
 
     ax.set_xscale('log'); ax.set_yscale('log')
     ax.set_xlim(1e-4, 1.5)
@@ -346,13 +368,14 @@ try:
     samples_phys_B[:, 0] = 10**samples_phys_B[:, 0] * 1e6   # F0_1 uJy
     samples_phys_B[:, 1] = 10**samples_phys_B[:, 1] * 1440  # tb_1 min
     samples_phys_B[:, 3] = 10**samples_phys_B[:, 3] * 1e6   # F0_2 uJy
-    samples_phys_B[:, 4] = 10**samples_phys_B[:, 4] * 1440  # tb_2 min
+    samples_phys_B[:, 4] = 10**samples_phys_B[:, 4] * 1440  # tb2a_2 min
+    samples_phys_B[:, 5] = 10**samples_phys_B[:, 5] * 1440  # tb2b_2 min
     with plt.rc_context({'text.usetex': True}):
         fig_c = corner.corner(
             samples_phys_B,
-            labels=[r'$F_{0,1}$ ($\mu$Jy)', r'$t_{\rm break,1}$ (min)', r'$\alpha_{1,1}$',
-                    r'$F_{0,2}$ ($\mu$Jy)', r'$t_{\rm break,2}$ (min)', r'$\alpha_{1,2}$',
-                    r'$\alpha_{2,\rm shared}$'],
+            labels=[r'$F_{0,1}$ ($\mu$Jy)', r'$t_{\rm b,1}$ (min)', r'$\alpha_{1,1}$',
+                    r'$F_{0,2}$ ($\mu$Jy)', r'$t_{\rm b1,2}$ (min)', r'$t_{\rm b2,2}$ (min)',
+                    r'$\alpha_{1,2}$', r'$\alpha_{2,2}$', r'$\alpha_{2,\rm shared}$'],
             quantiles=[0.16, 0.5, 0.84], show_titles=True,
             title_fmt='.2f', label_kwargs={'fontsize': 10})
         fig_c.savefig('GRB260207A_corner_B_shared.png', dpi=110)
