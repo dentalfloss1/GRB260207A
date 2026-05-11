@@ -1,14 +1,14 @@
 """
-GRB260207A — emcee fit of P1-SBPL + P2-DSBPL model.
+GRB260207A — emcee fit of P1-SBPL + P2-TSBPL model.
 
-Fit B: t in (0, 0.1 d]  (includes straddle, excludes noisy late times)
+Fit B: t in (0, 0.8 d]  with logarithmic binning
 P1 rise and decay indices are fixed; only P2 and P1 amplitude/break are free.
 
 Priors:
-  log_uniform on F0_1, F0_2           (wide range across decades)
-  log_uniform on tb_1, tb2a_2, tb2b_2 (covers all reasonable break times)
+  log_uniform on F0_1, F0_2                    (wide range across decades)
+  log_uniform on tb_1, tb2a_2, tb2b_2, tb2c_2 (covers all reasonable break times)
   uniform on alpha indices
-  ordering: tb2a_2 < tb2b_2 enforced
+  ordering: tb2a_2 < tb2b_2 < tb2c_2 enforced
 
 Fixed parameters:
   a1_1 = -0.5  (P1 rise: F ~ t^+0.5)
@@ -16,14 +16,21 @@ Fixed parameters:
 
 Sampled parameters:
   theta = [log10(F0_1), log10(tb_1),
-           log10(F0_2), log10(tb2a_2), log10(tb2b_2), a1_2, a2_2, a3_2]
+           log10(F0_2), log10(tb2a_2), log10(tb2b_2), log10(tb2c_2),
+           a1_2, a2_2, a3_2, a4_2]
 """
 
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import emcee
 from scipy.optimize import curve_fit
 from astropy.time import Time
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--nomodel', action='store_true',
+                    help='Plot data only — skip emcee fitting')
+args = parser.parse_args()
 
 trigger_tjd = Time("2026-02-07 05:40:16.947").jd - 2457000
 
@@ -43,10 +50,39 @@ eflux_all = yerr_all * zp
 CADENCE = 200 / 86400
 HALF_C  = CADENCE / 2
 
-mask_plot = (x_all > -HALF_C) & (x_all <= 1.5)
-x_plot  = x_all[mask_plot]
-y_plot  = flux_all[mask_plot]
-ye_plot = eflux_all[mask_plot]
+def log_bin(x_pos, y_pos, yerr_pos, n_per_decade=5):
+    """Log-bin positive-time data. All points (including negative flux) included before binning."""
+    t_min, t_max = x_pos.min(), x_pos.max()
+    n_bins = max(1, int(np.log10(t_max / t_min) * n_per_decade))
+    edges = np.logspace(np.log10(t_min), np.log10(t_max), n_bins + 1)
+    x_b, y_b, ye_b = [], [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (x_pos >= lo) & (x_pos < hi)
+        if not m.any():
+            continue
+        w = 1.0 / yerr_pos[m]**2
+        x_b.append(np.average(x_pos[m], weights=w))
+        y_b.append(np.average(y_pos[m], weights=w))
+        ye_b.append(1.0 / np.sqrt(w.sum()))
+    return np.array(x_b), np.array(y_b), np.array(ye_b)
+
+mask_plot = (x_all > -HALF_C) & (x_all <= 10)
+x_plot_raw  = x_all[mask_plot]
+y_plot_raw  = flux_all[mask_plot]
+ye_plot_raw = eflux_all[mask_plot]
+
+# Log-bin only data beyond 8e-2 d; earlier positive data kept as raw points
+LOG_BIN_START = 6e-2
+_pre   = x_plot_raw <= 0
+_early = (x_plot_raw > 0) & (x_plot_raw <= LOG_BIN_START)
+_pos   = x_plot_raw > LOG_BIN_START
+x_bin, y_bin, ye_bin = log_bin(x_plot_raw[_pos], y_plot_raw[_pos], ye_plot_raw[_pos])
+
+x_plot  = np.concatenate([x_plot_raw[_pre], x_plot_raw[_early], x_bin])
+y_plot  = np.concatenate([y_plot_raw[_pre], y_plot_raw[_early], y_bin])
+ye_plot = np.concatenate([ye_plot_raw[_pre], ye_plot_raw[_early], ye_bin])
+_ord = np.argsort(x_plot)
+x_plot = x_plot[_ord]; y_plot = y_plot[_ord]; ye_plot = ye_plot[_ord]
 
 # ---------------------------------------------------------------
 # Model
@@ -62,10 +98,17 @@ def dsbpl(t, F0, tb1, tb2, a1, a2, a3, S=S):
     f2 = (0.5 * (1 + (t/tb2)**(1/S)))**(-(a3-a2)*S)
     return F0 * (t/tb1)**(-a1) * f1 * f2
 
+def tsbpl(t, F0, tb1, tb2, tb3, a1, a2, a3, a4, S=S):
+    """Triple SBPL: breaks at tb1 (a1->a2), tb2 (a2->a3), tb3 (a3->a4)."""
+    f1 = (0.5 * (1 + (t/tb1)**(1/S)))**(-(a2-a1)*S)
+    f2 = (0.5 * (1 + (t/tb2)**(1/S)))**(-(a3-a2)*S)
+    f3 = (0.5 * (1 + (t/tb3)**(1/S)))**(-(a4-a3)*S)
+    return F0 * (t/tb1)**(-a1) * f1 * f2 * f3
+
 def model_2sbpl(t, F0_1, tb_1, a1_1, a2_1,
-                   F0_2, tb2a_2, tb2b_2, a1_2, a2_2, a3_2):
+                   F0_2, tb2a_2, tb2b_2, tb2c_2, a1_2, a2_2, a3_2, a4_2):
     p1 = sbpl(t, F0_1, tb_1, a1_1, a2_1)
-    p2 = dsbpl(t, F0_2, tb2a_2, tb2b_2, a1_2, a2_2, a3_2)
+    p2 = tsbpl(t, F0_2, tb2a_2, tb2b_2, tb2c_2, a1_2, a2_2, a3_2, a4_2)
     return np.where(p1 > 0, p1, 0) + np.where(p2 > 0, p2, 0)
 
 HALF_WIN_DAY = CADENCE / 2.0
@@ -118,11 +161,13 @@ PRIOR_RANGES = {
     'logF1':   (-6.0, -2.3),
     'logTb1':  (-4.0, -1.0),
     'logF2':   (-6.0, -2.3),
-    'logTb2a': (-4.0, -1.0),
-    'logTb2b': (-4.0, -1.0),
+    'logTb2a': (-4.0, 0.0),
+    'logTb2b': (-4.0, -0.7),  # cap ~0.2 d — break expected ~5e-2 d
+    'logTb2c': (-4.0, -0.5),  # cap ~0.32 d — break expected ~0.1 d
     'a1_2':    (-50.0, 0.0),
     'a2_2':    (-2.0, 3.0),
     'a3_2':    (0.2, 5.0),
+    'a4_2':    (0.5, 30.0),
 }
 PARAM_NAMES = list(PRIOR_RANGES.keys())
 
@@ -130,16 +175,18 @@ def log_prior(theta):
     for v, (lo, hi) in zip(theta, PRIOR_RANGES.values()):
         if not (lo <= v <= hi):
             return -np.inf
-    # Require first P2 break before second
+    # Require tb2a < tb2b < tb2c
     if theta[4] <= theta[3]:
+        return -np.inf
+    if theta[5] <= theta[4]:
         return -np.inf
     return 0.0
 
 def theta_to_params(theta):
     """Convert sampled theta (log10 for F and tb) to physical parameters."""
-    logF1, logTb1, logF2, logTb2a, logTb2b, a1_2, a2_2, a3_2 = theta
+    logF1, logTb1, logF2, logTb2a, logTb2b, logTb2c, a1_2, a2_2, a3_2, a4_2 = theta
     return (10**logF1, 10**logTb1, A1_1_FIXED, A2_1_FIXED,
-            10**logF2, 10**logTb2a, 10**logTb2b, a1_2, a2_2, a3_2)
+            10**logF2, 10**logTb2a, 10**logTb2b, 10**logTb2c, a1_2, a2_2, a3_2, a4_2)
 
 def log_likelihood(theta, x, y, yerr):
     params = theta_to_params(theta)
@@ -193,19 +240,63 @@ def run_emcee(x, y, yerr, theta0, label, nwalkers=32, nburn=500, nprod=10_000):
     return sampler
 
 # ---------------------------------------------------------------
+# Data-only plot (used by --nomodel)
+# ---------------------------------------------------------------
+def plot_data_only(ax):
+    pos = y_plot > 0
+    if (~pos).any():
+        ax.errorbar(x_plot[~pos], np.abs(y_plot[~pos]), yerr=ye_plot[~pos],
+                    fmt='.', color='lightgray', markersize=2, elinewidth=0.4,
+                    alpha=0.3, capsize=0, zorder=1)
+    if pos.any():
+        ax.errorbar(x_plot[pos], y_plot[pos], yerr=ye_plot[pos],
+                    fmt='.', color='black', markersize=3, elinewidth=0.4,
+                    alpha=0.8, capsize=0, zorder=2, label='TESS')
+    ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
+                color='mediumseagreen', markersize=8, elinewidth=1.4,
+                capsize=4, markeredgecolor='k', markeredgewidth=0.6,
+                label=f'MASTER T+{t_master*1440:.1f} min')
+
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlim(1e-4, 10)
+    vis = (x_plot >= 1e-4) & (x_plot <= 10) & pos
+    ax.set_ylim(ye_plot[vis].min() * 0.3, max(y_plot[vis].max(), F_master) * 3)
+    ax.set_xlabel('Days post-burst', fontsize=11)
+    ax.legend(fontsize=8, loc='lower left')
+    ax.grid(True, which='both', alpha=0.2, lw=0.5)
+
+    ax_min = ax.twiny()
+    ax_min.set_xscale('log'); ax_min.set_xlim(ax.get_xlim())
+    min_ticks = [0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+    ax_min.set_xticks([m/1440. for m in min_ticks])
+    ax_min.set_xticklabels([str(m) for m in min_ticks], fontsize=8)
+    ax_min.set_xlabel('Minutes post-burst', fontsize=10)
+
+if args.nomodel:
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    plot_data_only(ax)
+    ax.set_ylabel('Flux density (Jy)', fontsize=11)
+    plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
+    plt.tight_layout()
+    plt.savefig('GRB260207A_data_only.png', dpi=130, bbox_inches='tight')
+    plt.close()
+    print("Saved: GRB260207A_data_only.png")
+    raise SystemExit(0)
+
+# ---------------------------------------------------------------
 # Set up dataset — Fit B: 0 to 0.1 d
 # ---------------------------------------------------------------
-mask_B = ((x_plot > 0) & (x_plot <= 0.1) & (ye_plot > 0))
+mask_B = ((x_plot > 0) & (x_plot <= 0.8) & (y_plot > 0))
 xB = x_plot[mask_B]; yB = y_plot[mask_B]; yeB = ye_plot[mask_B]
 
 print(f"Fit B: N = {len(xB)},  t in [{xB.min()*1440:.2f}, {xB.max():.3f} d]")
 
 # Initial point informed by previous fits:
 #   Peak 1: F0 ~ 700 uJy, tb ~ 10 min  (a1_1, a2_1 fixed)
-#   Peak 2: F0 ~ 300 uJy, tb2a ~ 45 min, tb2b ~ 75 min, a1 ~ -10, a2 ~ 0, a3 ~ 2
+#   Peak 2: F0 ~ 300 uJy, tb2a ~ 45 min, tb2b ~ 75 min, tb2c ~ 0.09 d, a1 ~ -10, a2 ~ 0, a3 ~ 2, a4 ~ 10
 theta0 = [
     np.log10(7e-4),  np.log10(10/1440),
-    np.log10(3e-4),  np.log10(45/1440), np.log10(75/1440), -10.0, 0.0, 2.0,
+    np.log10(3e-4),  np.log10(45/1440), np.log10(75/1440), np.log10(0.09), -10.0, 0.0, 2.0, 10.0,
 ]
 
 np.random.seed(42)
@@ -237,15 +328,15 @@ bestB, paramsB, qB, samplesB, logprobB = summarize(samplerB, 'Fit B')
 
 # chi^2
 chi2B = -2 * np.max(logprobB)
-chi2_rB = chi2B / (len(xB) - 8)
+chi2_rB = chi2B / (len(xB) - 10)
 
 # Display
-print(f"\n=== FIT B SUMMARY (t > 0, t <= 0.1 d, N={len(xB)}) ===")
+print(f"\n=== FIT B SUMMARY (t > 0, t <= 0.8 d, log-binned, N={len(xB)}) ===")
 print(f"  Fixed: a1_1={A1_1_FIXED}, a2_1={A2_1_FIXED}")
 print(f"  Best chi2_r = {chi2_rB:.3f}")
 labels_phys = ['F0_1 (uJy)', 'tb_1 (min)',
-               'F0_2 (uJy)', 'tb2a_2 (min)', 'tb2b_2 (min)', 'a1_2', 'a2_2', 'a3_2']
-scale = [1e6, 1440, 1e6, 1440, 1440, 1, 1, 1]
+               'F0_2 (uJy)', 'tb2a_2 (min)', 'tb2b_2 (min)', 'tb2c_2 (min)', 'a1_2', 'a2_2', 'a3_2', 'a4_2']
+scale = [1e6, 1440, 1e6, 1440, 1440, 1440, 1, 1, 1, 1]
 for (name, q16, q50, q84), lbl, sc, p in zip(qB, labels_phys, scale, paramsB[:2] + paramsB[4:]):
     print(f"  {lbl:>14s}:  median={q50*sc:8.2f}  +{(q84-q50)*sc:6.2f} -{(q50-q16)*sc:6.2f}  best={p*sc:8.2f}")
 
@@ -260,7 +351,7 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
 
     pos = y_plot > 0
     fitted_pos = mask_used & pos
-    excluded_pos = ~mask_used & pos & (x_plot < 1.5)
+    excluded_pos = ~mask_used & pos & (x_plot < 10)
 
     if (~pos).any():
         ax.errorbar(x_plot[~pos], np.abs(y_plot[~pos]), yerr=ye_plot[~pos],
@@ -281,7 +372,7 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
                 label=f'MASTER T+{t_master*1440:.1f} min')
 
     # Posterior draws
-    t_model = np.logspace(np.log10(2e-4), np.log10(1.5), 1500)
+    t_model = np.logspace(np.log10(2e-4), np.log10(10), 1500)
     rng = np.random.default_rng(42)
     idx = rng.choice(len(samples), n_draws, replace=False)
     for i in idx:
@@ -293,8 +384,8 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
     ymod_best = model_2sbpl(t_model, *params_best)
     p1_best = sbpl(t_model, params_best[0], params_best[1],
                    params_best[2], params_best[3])
-    p2_best = dsbpl(t_model, params_best[4], params_best[5], params_best[6],
-                    params_best[7], params_best[8], params_best[9])
+    p2_best = tsbpl(t_model, params_best[4], params_best[5], params_best[6], params_best[7],
+                    params_best[8], params_best[9], params_best[10], params_best[11])
     ax.plot(t_model, ymod_best, '-', color='crimson', lw=2.0, zorder=6,
             label=f'Best fit (χ²_r={chi2_r:.2f})')
     ax.plot(t_model, np.where(p1_best>0, p1_best, np.nan), '--',
@@ -303,12 +394,12 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
                   f'  α=({params_best[2]:.2f},{params_best[3]:.2f})')
     ax.plot(t_model, np.where(p2_best>0, p2_best, np.nan), ':',
             color='steelblue', lw=1.6, zorder=5,
-            label=f'P2 tb=({params_best[5]*1440:.1f},{params_best[6]*1440:.1f}) min'
-                  f'  α=({params_best[7]:.2f},{params_best[8]:.2f},{params_best[9]:.2f})')
+            label=f'P2 tb=({params_best[5]*1440:.1f},{params_best[6]*1440:.1f},{params_best[7]*1440:.1f}) min'
+                  f'  α=({params_best[8]:.2f},{params_best[9]:.2f},{params_best[10]:.2f},{params_best[11]:.2f})')
 
     ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlim(1e-4, 1.5)
-    vis = (x_plot >= 1e-4) & (x_plot <= 1.5) & (y_plot > 0)
+    ax.set_xlim(1e-4, 10)
+    vis = (x_plot >= 1e-4) & (x_plot <= 10) & (y_plot > 0)
     ax.set_ylim(ye_plot[vis].min() * 0.3, max(y_plot[vis].max(), F_master) * 3)
     ax.set_xlabel('Days post-burst', fontsize=11)
     ax.set_title(label, fontsize=11)
@@ -317,14 +408,14 @@ def plot_fit(ax, sampler, mask_used, label, chi2_r, n_draws=200):
 
     ax_min = ax.twiny()
     ax_min.set_xscale('log'); ax_min.set_xlim(ax.get_xlim())
-    min_ticks = [0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+    min_ticks = [0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
     ax_min.set_xticks([m/1440. for m in min_ticks])
     ax_min.set_xticklabels([str(m) for m in min_ticks], fontsize=8)
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
 fig_b, ax_b = plt.subplots(figsize=(8, 6.5))
 plot_fit(ax_b, samplerB, mask_B,
-         f'Fit B: t in (0, 0.1 d]   (N={len(xB)})', chi2_rB)
+         f'Fit B: t in (0, 0.8 d], log-binned   (N={len(xB)})', chi2_rB)
 ax_b.set_ylabel('Flux density (Jy)', fontsize=11)
 plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
 plt.tight_layout()
@@ -344,12 +435,13 @@ try:
     samples_phys_B[:, 2] = 10**samples_phys_B[:, 2] * 1e6   # F0_2 uJy
     samples_phys_B[:, 3] = 10**samples_phys_B[:, 3] * 1440  # tb2a_2 min
     samples_phys_B[:, 4] = 10**samples_phys_B[:, 4] * 1440  # tb2b_2 min
+    samples_phys_B[:, 5] = 10**samples_phys_B[:, 5] * 1440  # tb2c_2 min
     with plt.rc_context({'text.usetex': True}):
         fig_c = corner.corner(
             samples_phys_B,
             labels=[r'$F_{0,1}$ ($\mu$Jy)', r'$t_{\rm b,1}$ (min)',
-                    r'$F_{0,2}$ ($\mu$Jy)', r'$t_{\rm b1,2}$ (min)', r'$t_{\rm b2,2}$ (min)',
-                    r'$\alpha_{1,2}$', r'$\alpha_{2,2}$', r'$\alpha_{3,2}$'],
+                    r'$F_{0,2}$ ($\mu$Jy)', r'$t_{\rm b1,2}$ (min)', r'$t_{\rm b2,2}$ (min)', r'$t_{\rm b3,2}$ (min)',
+                    r'$\alpha_{1,2}$', r'$\alpha_{2,2}$', r'$\alpha_{3,2}$', r'$\alpha_{4,2}$'],
             quantiles=[0.16, 0.5, 0.84], show_titles=True,
             title_fmt='.2f', label_kwargs={'fontsize': 10})
         fig_c.savefig('GRB260207A_corner_B.png', dpi=110)
