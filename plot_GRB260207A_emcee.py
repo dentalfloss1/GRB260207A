@@ -1,31 +1,18 @@
 """
-GRB260207A — emcee comparison of four models.
+GRB260207A — emcee fit of a single forward-shock model.
 
-Fit range: t in [-1.0, 2.0 d], unbinned.
-  Background power law: constrained by full range [-1.0, 2.0 d].
-  Power-law components: active for t > 0, naturally declining; break times
-  are bounded to < 0.1 d so SBPLs are well past their peaks by 0.2 d.
+Fit range: t in [-1.0, 0.02 d], unbinned.
+  Forward shock: smoothly broken power law, active for t > 0.
+  Rise is fixed to t**0.5.
+  Decay is fixed by p as t**[-3(p-1)/4], with 2.1 <= p <= 2.5.
 
-Model A  SBPL + SBPL + TESS-bg constant, S=0.1               [9 free params]
-Model B  SBPL + SBPL + sigmoid×PL(flare) + TESS-bg constant  [13 free params]
-Model C  SBPL + DSBPL + sigmoid×PL(flare) + TESS-bg constant [15 free params]
-         P1: S=0.1, P2: S=0.02
-Model D  DSBPL + SBPL + TESS-bg constant, S=0.1              [11 free params]
-         P1: doubly-broken, tb1a 3–30 min, tb1b 0.1–0.15 d; P2: tb2 29 min–0.1 d
-
-All models fit P1 rise (a1_1) and decay (a2_1) slopes freely.
 TESS background: constant C_bg = 10^logC_bg (Jy), evaluated everywhere.
-  Power-law components are zero for t <= 0; background is evaluated everywhere.
-
-Parallelised: Models A, B, C run concurrently via ProcessPoolExecutor.
-              log_prob functions are module-level so they are picklable.
+The plotted model is extrapolated across the current full plot range.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import emcee
-from concurrent.futures import ProcessPoolExecutor
 from astropy.time import Time
 
 # ---------------------------------------------------------------
@@ -40,22 +27,17 @@ eF_master   = F_master * 0.30
 CADENCE    = 200 / 86400
 HALF_C     = CADENCE / 2
 S_AB       = 0.1
-S_C        = 0.02
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
-PL_CUTOFF  = 0.2             # days — power-law components zeroed beyond this
+FS_FIT_MAX = 0.02            # days post-burst
+SHIFT_FIT_MAX = 0.08         # days after computed shifted origin for DSBPL fit
+SHIFT_PLOT_MAX = 1.0         # days after computed shifted origin for DSBPL plot
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
 # ---------------------------------------------------------------
 def sbpl(t, F0, tb, a1, a2, S):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
-
-def tsbpl(t, F0, tb1, tb2, tb3, a1, a2, a3, a4, S):
-    f1 = (0.5*(1+(t/tb1)**(1/S)))**(-(a2-a1)*S)
-    f2 = (0.5*(1+(t/tb2)**(1/S)))**(-(a3-a2)*S)
-    f3 = (0.5*(1+(t/tb3)**(1/S)))**(-(a4-a3)*S)
-    return F0 * (t/tb1)**(-a1) * f1 * f2 * f3
 
 def dsbpl(t, F0, tb1, tb2, a1, a2, a3, S):
     f1 = (0.5*(1 + (t/tb1)**(1/S)))**(-(a2-a1)*S)
@@ -66,7 +48,7 @@ def windowed_eval(model_fn, t_arr, params):
     """Integrate near-trigger (t < 5 min) points over 200-s cadence window.
 
     Pre-burst points whose entire window is at t<=0 are vectorised into a
-    single model call (returns background polynomial only — no power-law loop).
+    single model call (returns constant background only — no power-law loop).
     Only the handful of points near t=0 whose window straddles the trigger
     go through the per-point integration loop.
     """
@@ -97,314 +79,118 @@ def windowed_eval(model_fn, t_arr, params):
     return out
 
 # ===============================================================
-# MODEL A — SBPL + SBPL + TESS-bg constant, S=0.1
-# theta: [logF1, logTb1, a1_1, a2_1, logF2, logTb2, a1_2, a2_2, logC_bg]
+# Forward-shock model — SBPL + TESS-bg constant, S=0.1
+# theta: [logF0, logTb, p, logC_bg]
 # ===============================================================
-def model_A(t, F0_1, tb_1, a1_1, a2_1, F0_2, tb_2, a1_2, a2_2, C_bg):
+FS_RISE_ALPHA = -0.5
+
+def decay_alpha_from_p(p):
+    return 3.0 * (p - 1.0) / 4.0
+
+def model_FS(t, F0, tb, p, C_bg):
     pos = t > 0
     ts  = np.where(pos, t, 1e-10)
-    p1  = np.where(pos, sbpl(ts, F0_1, tb_1, a1_1, a2_1, S_AB), 0.0)
-    p2  = np.where(pos, sbpl(ts, F0_2, tb_2, a1_2, a2_2, S_AB), 0.0)
-    return p1 + p2 + C_bg
+    a2  = decay_alpha_from_p(p)
+    fs  = np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, S_AB), 0.0)
+    return fs + C_bg
 
-PRIOR_A = {
-    'logF1':   (-6.0, -2.3),   'logTb1':  (-2.523, -1.699),
-    'a1_1':    (-10.0,  0.0),  'a2_1':    (  0.2,   5.0),
-    'logF2':   (-6.0, -2.3),   'logTb2':  (-1.699,  -1.0),
-    'a1_2':    (-50.0,  0.0),  'a2_2':    (  0.2,   5.0),
+PRIOR_FS = {
+    'logF0':   (-6.0, -2.3),
+    'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
+    'p':       ( 2.1,  2.5),
     'logC_bg': (-10.0, -2.0),
 }
-NAMES_A = list(PRIOR_A.keys())
+NAMES_FS = list(PRIOR_FS.keys())
 
-def log_prior_A(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_A.values()):
+def log_prior_FS(theta):
+    for v, (lo, hi) in zip(theta, PRIOR_FS.values()):
         if not (lo <= v <= hi): return -np.inf
     return 0.0
 
-def theta_to_params_A(theta):
-    logF1, logTb1, a1_1, a2_1, logF2, logTb2, a1_2, a2_2, logC_bg = theta
-    return (10**logF1, 10**logTb1, a1_1, a2_1,
-            10**logF2, 10**logTb2, a1_2, a2_2,
-            10**logC_bg)
+def theta_to_params_FS(theta):
+    logF0, logTb, p, logC_bg = theta
+    return (10**logF0, 10**logTb, p, 10**logC_bg)
 
-def log_prob_A(theta, x, y, yerr):
-    lp = log_prior_A(theta)
+def log_prob_FS(theta, x, y, yerr):
+    lp = log_prior_FS(theta)
     if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_A(theta)
-    try:    ymod = windowed_eval(model_A, x, params)
+    params = theta_to_params_FS(theta)
+    try:    ymod = windowed_eval(model_FS, x, params)
     except: return -np.inf
     if not np.all(np.isfinite(ymod)): return -np.inf
-    C_bg = params[-1]
-    yeff = np.where((x > 0) & (x <= PL_CUTOFF), ymod, C_bg)
-    return lp - 0.5 * np.sum(((y - yeff) / yerr)**2)
+    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
-def get_components_A(t, p):
-    # p: F0_1, tb_1, a1_1, a2_1, F0_2, tb_2, a1_2, a2_2, C_bg
-    pos = (t > 0) & (t <= PL_CUTOFF)
+def get_components_FS(t, p):
+    # p: F0, tb, electron-index p, C_bg
+    pos = t > 0
     ts  = np.where(pos, t, 1e-10)
-    c1  = np.where(pos, sbpl(ts, p[0], p[1], p[2], p[3], S_AB), 0.0)
-    c2  = np.where(pos, sbpl(ts, p[4], p[5], p[6], p[7], S_AB), 0.0)
-    cbg = np.full_like(t, p[8])
+    a2  = decay_alpha_from_p(p[2])
+    fs  = np.where(pos, sbpl(ts, p[0], p[1], FS_RISE_ALPHA, a2, S_AB), 0.0)
+    cbg = np.full_like(t, p[3])
     return [
-        ('P1', c1, '--', 'goldenrod',
-         f"tb={p[1]*1440:.1f} min  α=({p[2]:.2f},{p[3]:.2f})"),
-        ('P2', c2, ':',  'steelblue',
-         f"tb={p[5]*1440:.1f} min  α=({p[6]:.2f},{p[7]:.2f})"),
+        ('Forward shock', fs, '--', 'goldenrod',
+         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  p={p[2]:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
-         f"C_bg={p[8]*1e6:.2f} µJy"),
+         f"C_bg={p[3]*1e6:.2f} µJy"),
     ]
 
-theta0_A = np.array([np.log10(7e-4), np.log10(10/1440),
-                     -0.5, 1.0,
-                     np.log10(3e-4),  np.log10(75/1440), -10.0, 2.0,
-                     -4.5])
+theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), 2.25, -4.5])
 
 # ===============================================================
-# MODEL B — SBPL + SBPL + sigmoid×PL(flare) + TESS-bg constant
-# P3 = F0_3 * sigmoid(t/t3, k3) * (t/t3)^{-a2_3}
-#   sigmoid gives a sharp rise at t3; k3 controls sharpness.
-#   Power law gives the decay after the peak.
-# theta: [logF1, logTb1, a1_1, a2_1,
-#         logF2, logTb2, a1_2, a2_2,
-#         logF3, logT3, logK3, a2_3,
-#         logC_bg]
+# Shifted excess model — DSBPL + constant background
+# theta: [logF0, logTb1, logTb2, a1, a2, a3, logC_bg]
 # ===============================================================
-def model_B(t, F0_1, tb_1, a1_1, a2_1, F0_2, tb_2, a1_2, a2_2,
-            F0_3, t3, k3, a2_3, C_bg):
+S_SHIFT = 0.02
+
+def model_shifted_excess(t, F0, tb1, tb2, a1, a2, a3, C_bg):
     pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
-    p1  = np.where(pos, sbpl(ts, F0_1, tb_1, a1_1, a2_1, S_AB), 0.0)
-    p2  = np.where(pos, sbpl(ts, F0_2, tb_2, a1_2, a2_2, S_AB), 0.0)
-    sig = np.where(pos, 1.0 / (1.0 + (ts / t3)**(-k3)), 0.0)
-    p3  = np.where(pos, F0_3 * sig * (ts / t3)**(-a2_3), 0.0)
-    return p1 + p2 + p3 + C_bg
+    ts = np.where(pos, t, 1e-10)
+    comp = np.where(pos, dsbpl(ts, F0, tb1, tb2, a1, a2, a3, S_SHIFT), 0.0)
+    return comp + C_bg
 
-PRIOR_B = {
-    'logF1':   (-6.0, -2.3),   'logTb1':  (-2.523, -1.699),
-    'a1_1':    (-10.0,  0.0),  'a2_1':    (  0.2,   5.0),
-    'logF2':   (-6.0, -2.3),   'logTb2':  (-1.699,  -1.0),
-    'a1_2':    (-50.0,  0.0),  'a2_2':    (  0.2,   5.0),
-    'logF3':   (-6.0, -2.3),   'logT3':   (-1.5,    0.0),
-    'logK3':   ( 0.0,  2.0),   'a2_3':    (  1.0,  30.0),
-    'logC_bg': (-10.0, -2.0),
+PRIOR_SHIFT = {
+    'logF0':   (-6.5, -2.5),
+    'logTb1':  (np.log10(0.01), np.log10(0.02)),
+    'logTb2':  (np.log10(0.02), np.log10(0.05)),
+    'a1':      (-8.0,  0.0),
+    'a2':      (-2.0,  5.0),
+    'a3':      ( 0.2, 12.0),
+    'logC_bg': (-10.0, -3.0),
 }
-NAMES_B = list(PRIOR_B.keys())
+NAMES_SHIFT = list(PRIOR_SHIFT.keys())
 
-def log_prior_B(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_B.values()):
+def log_prior_shift(theta):
+    for v, (lo, hi) in zip(theta, PRIOR_SHIFT.values()):
         if not (lo <= v <= hi): return -np.inf
+    if theta[2] <= theta[1]: return -np.inf
     return 0.0
 
-def theta_to_params_B(theta):
-    logF1, logTb1, a1_1, a2_1, logF2, logTb2, a1_2, a2_2, \
-        logF3, logT3, logK3, a2_3, logC_bg = theta
-    return (10**logF1, 10**logTb1, a1_1, a2_1,
-            10**logF2, 10**logTb2, a1_2, a2_2,
-            10**logF3, 10**logT3, 10**logK3, a2_3,
-            10**logC_bg)
+def theta_to_params_shift(theta):
+    logF0, logTb1, logTb2, a1, a2, a3, logC_bg = theta
+    return (10**logF0, 10**logTb1, 10**logTb2, a1, a2, a3, 10**logC_bg)
 
-def log_prob_B(theta, x, y, yerr):
-    lp = log_prior_B(theta)
+def log_prob_shift(theta, x, y, yerr):
+    lp = log_prior_shift(theta)
     if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_B(theta)
-    try:    ymod = windowed_eval(model_B, x, params)
-    except: return -np.inf
+    params = theta_to_params_shift(theta)
+    ymod = model_shifted_excess(x, *params)
     if not np.all(np.isfinite(ymod)): return -np.inf
-    C_bg = params[-1]
-    yeff = np.where((x > 0) & (x <= PL_CUTOFF), ymod, C_bg)
-    return lp - 0.5 * np.sum(((y - yeff) / yerr)**2)
+    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
-def get_components_B(t, p):
-    # p: F0_1, tb_1, a1_1, a2_1, F0_2, tb_2, a1_2, a2_2,
-    #    F0_3, t3, k3, a2_3, C_bg
-    pos = (t > 0) & (t <= PL_CUTOFF)
-    ts  = np.where(pos, t, 1e-10)
-    c1  = np.where(pos, sbpl(ts, p[0], p[1], p[2], p[3], S_AB), 0.0)
-    c2  = np.where(pos, sbpl(ts, p[4], p[5], p[6], p[7], S_AB), 0.0)
-    sig = np.where(pos, 1.0 / (1.0 + (ts / p[9])**(-p[10])), 0.0)
-    c3  = np.where(pos, p[8] * sig * (ts / p[9])**(-p[11]), 0.0)
-    cbg = np.full_like(t, p[12])
+def get_components_shift(t, p):
+    pos = t > 0
+    ts = np.where(pos, t, 1e-10)
+    comp = np.where(pos, dsbpl(ts, p[0], p[1], p[2], p[3], p[4], p[5], S_SHIFT), 0.0)
+    cbg = np.full_like(t, p[6])
     return [
-        ('P1',       c1,  '--',              'goldenrod',
-         f"tb={p[1]*1440:.1f} min  α=({p[2]:.2f},{p[3]:.2f})"),
-        ('P2',       c2,  ':',               'steelblue',
-         f"tb={p[5]*1440:.1f} min  α=({p[6]:.2f},{p[7]:.2f})"),
-        ('P3 flare', c3,  '-.',              'darkorchid',
-         f"t3={p[9]*1440:.1f} min  k={p[10]:.1f}  α={p[11]:.2f}"),
-        ('TESS bg',  cbg, (0,(3,1,1,1)),     'mediumseagreen',
-         f"C_bg={p[12]*1e6:.2f} µJy"),
+        ('DSBPL excess', comp, '--', 'darkorange',
+         f"tb=({p[1]:.3f},{p[2]:.3f}) d  alpha=({p[3]:.2f},{p[4]:.2f},{p[5]:.2f})"),
+        ('bg', cbg, '-.', 'mediumseagreen',
+         f"C_bg={p[6]*1e6:.2f} uJy"),
     ]
 
-theta0_B = np.array([np.log10(7e-4), np.log10(10/1440),
-                     -0.5, 1.0,
-                     np.log10(3e-4), np.log10(75/1440), -10.0, 2.0,
-                     np.log10(5e-4), np.log10(200/1440), 1.5, 5.0,
-                     -4.5])
-
-# ===============================================================
-# MODEL C — SBPL + DSBPL + sigmoid×PL(flare) + TESS-bg constant, P1:S=0.1 P2:S=0.02
-# P3 = F0_3 * sigmoid(t/t3, k3) * (t/t3)^{-a2_3}  (same as Model B)
-# theta: [logF1, logTb1, a1_1, a2_1,
-#         logF2, logTb2a, logTb2b,
-#         a1_2, a2_2, a3_2,
-#         logF3, logT3, logK3, a2_3,
-#         logC_bg]
-# ===============================================================
-def model_C(t, F0_1, tb_1, a1_1, a2_1, F0_2, tb2a, tb2b,
-            a1_2, a2_2, a3_2, F0_3, t3, k3, a2_3, C_bg):
-    pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
-    p1  = np.where(pos, sbpl( ts, F0_1, tb_1, a1_1, a2_1, S_AB), 0.0)
-    p2  = np.where(pos, dsbpl(ts, F0_2, tb2a, tb2b, a1_2, a2_2, a3_2, S_C), 0.0)
-    sig = np.where(pos, 1.0 / (1.0 + (ts / t3)**(-k3)), 0.0)
-    p3  = np.where(pos, F0_3 * sig * (ts / t3)**(-a2_3), 0.0)
-    return p1 + p2 + p3 + C_bg
-
-PRIOR_C = {
-    'logF1':   (-6.0, -2.3),    'logTb1':  (-2.523, -1.699),
-    'a1_1':    (-10.0,  0.0),   'a2_1':    (  0.2,   5.0),
-    'logF2':   (-6.0, -2.3),    'logTb2a': (-4.0,    0.0),
-    'logTb2b': (-1.523, -1.155),
-    'a1_2':    (-50.0,  0.0),   'a2_2':    ( -2.0,   3.0),
-    'a3_2':    (  0.2,  5.0),
-    'logF3':   (-6.0, -2.3),    'logT3':   (-1.5,    0.0),
-    'logK3':   ( 0.0,  2.0),    'a2_3':    (  1.0,  30.0),
-    'logC_bg': (-10.0, -2.0),
-}
-NAMES_C = list(PRIOR_C.keys())
-
-def log_prior_C(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_C.values()):
-        if not (lo <= v <= hi): return -np.inf
-    # logTb2a < logTb2b  (indices 5, 6)
-    if theta[6] <= theta[5]: return -np.inf
-    return 0.0
-
-def theta_to_params_C(theta):
-    logF1, logTb1, a1_1, a2_1, logF2, logTb2a, logTb2b, \
-        a1_2, a2_2, a3_2, logF3, logT3, logK3, a2_3, logC_bg = theta
-    return (10**logF1, 10**logTb1, a1_1, a2_1,
-            10**logF2, 10**logTb2a, 10**logTb2b,
-            a1_2, a2_2, a3_2,
-            10**logF3, 10**logT3, 10**logK3, a2_3,
-            10**logC_bg)
-
-def log_prob_C(theta, x, y, yerr):
-    lp = log_prior_C(theta)
-    if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_C(theta)
-    try:    ymod = windowed_eval(model_C, x, params)
-    except: return -np.inf
-    if not np.all(np.isfinite(ymod)): return -np.inf
-    C_bg = params[-1]
-    yeff = np.where((x > 0) & (x <= PL_CUTOFF), ymod, C_bg)
-    return lp - 0.5 * np.sum(((y - yeff) / yerr)**2)
-
-def get_components_C(t, p):
-    # p: F0_1, tb_1, a1_1, a2_1, F0_2, tb2a, tb2b,
-    #    a1_2, a2_2, a3_2, F0_3, t3, k3, a2_3, C_bg
-    pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
-    c1  = np.where(pos, sbpl( ts, p[0], p[1], p[2], p[3], S_AB), 0.0)
-    c2  = np.where(pos, dsbpl(ts, p[4], p[5], p[6], p[7], p[8], p[9], S_C), 0.0)
-    sig = np.where(pos, 1.0 / (1.0 + (ts / p[11])**(-p[12])), 0.0)
-    c3  = np.where(pos, p[10] * sig * (ts / p[11])**(-p[13]), 0.0)
-    cbg = np.full_like(t, p[14])
-    return [
-        ('P1',         c1,  '--',          'goldenrod',
-         f"tb={p[1]*1440:.1f} min  α=({p[2]:.2f},{p[3]:.2f})"),
-        ('P2 (DSBPL)', c2,  ':',           'steelblue',
-         f"tb=({p[5]*1440:.1f},{p[6]*1440:.1f}) min  "
-         f"α=({p[7]:.2f},{p[8]:.2f},{p[9]:.2f})"),
-        ('P3 flare',   c3,  '-.',          'darkorchid',
-         f"t3={p[11]*1440:.1f} min  k={p[12]:.1f}  α={p[13]:.2f}"),
-        ('TESS bg',    cbg, (0,(3,1,1,1)), 'mediumseagreen',
-         f"C_bg={p[14]*1e6:.2f} µJy"),
-    ]
-
-theta0_C = np.array([np.log10(7e-4), np.log10(10/1440),
-                     -0.5, 1.0,
-                     np.log10(3e-4),
-                     np.log10(45/1440), np.log10(0.05),
-                     -10.0, 0.0, 2.0,
-                     np.log10(5e-4), np.log10(200/1440), 1.5, 5.0,
-                     -4.5])
-
-# ===============================================================
-# MODEL D — DSBPL + SBPL + TESS-bg constant, S=0.1
-# P1: doubly-broken power law with break at tb1a (3–30 min) and tb1b (0.1–0.15 d)
-# P2: SBPL with break at tb2 (29 min–0.1 d)
-# theta: [logF1, logTb1a, logTb1b, a1_1, a2_1, a3_1,
-#         logF2, logTb2, a1_2, a2_2,
-#         logC_bg]
-# ===============================================================
-def model_D(t, F0_1, tb1a, tb1b, a1_1, a2_1, a3_1,
-               F0_2, tb_2, a1_2, a2_2, C_bg):
-    pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
-    p1  = np.where(pos, dsbpl(ts, F0_1, tb1a, tb1b, a1_1, a2_1, a3_1, S_AB), 0.0)
-    p2  = np.where(pos, sbpl( ts, F0_2, tb_2, a1_2, a2_2, S_AB), 0.0)
-    return p1 + p2 + C_bg
-
-PRIOR_D = {
-    'logF1':   (-6.0, -2.3),
-    'logTb1a': (-2.523, -1.699),  # P1 break 1: 3–30 min
-    'logTb1b': (-1.0,   -0.824),  # P1 break 2: 0.1–0.15 d
-    'a1_1':    (-10.0,   0.0),
-    'a2_1':    (  0.0,   5.0),
-    'a3_1':    (  0.2,  30.0),    # steep post-break decline allowed
-    'logF2':   (-6.0,  -2.3),
-    'logTb2':  (-1.699, -1.0),    # P2: 29 min–0.1 d
-    'a1_2':    (-50.0,   0.0),
-    'a2_2':    (  0.2,   5.0),
-    'logC_bg': (-10.0,  -2.0),
-}
-NAMES_D = list(PRIOR_D.keys())
-
-def log_prior_D(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_D.values()):
-        if not (lo <= v <= hi): return -np.inf
-    return 0.0
-
-def theta_to_params_D(theta):
-    logF1, logTb1a, logTb1b, a1_1, a2_1, a3_1, \
-    logF2, logTb2, a1_2, a2_2, logC_bg = theta
-    return (10**logF1, 10**logTb1a, 10**logTb1b, a1_1, a2_1, a3_1,
-            10**logF2, 10**logTb2, a1_2, a2_2,
-            10**logC_bg)
-
-def log_prob_D(theta, x, y, yerr):
-    lp = log_prior_D(theta)
-    if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_D(theta)
-    try:    ymod = windowed_eval(model_D, x, params)
-    except: return -np.inf
-    if not np.all(np.isfinite(ymod)): return -np.inf
-    C_bg = params[-1]
-    yeff = np.where((x > 0) & (x <= PL_CUTOFF), ymod, C_bg)
-    return lp - 0.5 * np.sum(((y - yeff) / yerr)**2)
-
-def get_components_D(t, p):
-    # p: F0_1, tb1a, tb1b, a1_1, a2_1, a3_1, F0_2, tb_2, a1_2, a2_2, C_bg
-    pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
-    c1  = np.where(pos, dsbpl(ts, p[0], p[1], p[2], p[3], p[4], p[5], S_AB), 0.0)
-    c2  = np.where(pos, sbpl( ts, p[6], p[7], p[8], p[9], S_AB), 0.0)
-    cbg = np.full_like(t, p[10])
-    return [
-        ('P1 (DSBPL)', c1, '--', 'goldenrod',
-         f"tb1={p[1]*1440:.1f} min  tb2={p[2]*1440:.1f} min"
-         f"  α=({p[3]:.2f},{p[4]:.2f},{p[5]:.2f})"),
-        ('P2',         c2, ':',  'steelblue',
-         f"tb={p[7]*1440:.1f} min  α=({p[8]:.2f},{p[9]:.2f})"),
-        ('TESS bg',   cbg, '-.', 'mediumseagreen',
-         f"C_bg={p[10]*1e6:.2f} µJy"),
-    ]
-
-theta0_D = np.array([np.log10(7e-4), np.log10(10/1440), np.log10(0.15),
-                     -0.5, 1.0, 5.0,
-                     np.log10(3e-4), np.log10(75/1440), -10.0, 2.0,
-                     -4.5])
+theta0_SHIFT = np.array([np.log10(3e-4), np.log10(0.015), np.log10(0.035),
+                         -3.0, 1.0, 3.0, -5.0])
 
 # ---------------------------------------------------------------
 # Generic emcee runner
@@ -463,23 +249,17 @@ def run_emcee(x, y, yerr, theta0, prior_ranges, log_prob_fn, label,
     return sampler.get_chain(flat=True), sampler.get_log_prob(flat=True)
 
 # ---------------------------------------------------------------
-# Parallel worker functions  (module-level = picklable)
+# Fit wrapper
 # ---------------------------------------------------------------
-def _fit_A(xD, yD, yeD, quick=False):
+def _fit_FS(xD, yD, yeD, quick=False):
     np.random.seed(42)
-    return run_emcee(xD, yD, yeD, theta0_A, PRIOR_A, log_prob_A, 'Model A', quick=quick)
+    return run_emcee(xD, yD, yeD, theta0_FS, PRIOR_FS, log_prob_FS,
+                     'Forward shock', quick=quick)
 
-def _fit_B(xD, yD, yeD, quick=False):
-    np.random.seed(43)
-    return run_emcee(xD, yD, yeD, theta0_B, PRIOR_B, log_prob_B, 'Model B', quick=quick)
-
-def _fit_C(xD, yD, yeD, quick=False):
-    np.random.seed(44)
-    return run_emcee(xD, yD, yeD, theta0_C, PRIOR_C, log_prob_C, 'Model C', quick=quick)
-
-def _fit_D(xD, yD, yeD, quick=False):
-    np.random.seed(45)
-    return run_emcee(xD, yD, yeD, theta0_D, PRIOR_D, log_prob_D, 'Model D', quick=quick)
+def _fit_shift(xD, yD, yeD, quick=False):
+    np.random.seed(46)
+    return run_emcee(xD, yD, yeD, theta0_SHIFT, PRIOR_SHIFT, log_prob_shift,
+                     'Shifted excess DSBPL', quick=quick)
 
 # ---------------------------------------------------------------
 # Summarize flat chains
@@ -498,9 +278,9 @@ def summarize(flat_chain, flat_lp, theta_to_params_fn, param_names):
 # ---------------------------------------------------------------
 # Print parameter table
 # ---------------------------------------------------------------
-def print_params(tag, theta_best, param_names, quantiles,
-                 labels_phys, scale, chi2_r, bic_val):
-    print(f"\n=== MODEL {tag} ===  chi2_r={chi2_r:.3f}   BIC={bic_val:.1f}")
+def print_params(title, theta_best, param_names, quantiles,
+                 labels_phys, scale, chi2_r):
+    print(f"\n=== {title} ===  chi2_r={chi2_r:.3f}")
     print(f"  {'Parameter':>24s}   {'Best-fit':>9s}   {'Median':>9s}"
           f"   {'+1sigma':>8s}   {'-1sigma':>8s}")
     print(f"  {'-'*72}")
@@ -513,47 +293,18 @@ def print_params(tag, theta_best, param_names, quantiles,
 # Corner plots
 # ---------------------------------------------------------------
 _CORNER_CFG = {
-    'A': dict(
-        names=NAMES_A,
-        scale=[1e6, 1440, 1, 1, 1e6, 1440, 1, 1, 1e6],
-        labels=[r'$F_{0,1}\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{min})$',
-                r'$\alpha_{1,1}$', r'$\alpha_{2,1}$',
-                r'$F_{0,2}\ (\mu\mathrm{Jy})$', r'$t_{b,2}\ (\mathrm{min})$',
-                r'$\alpha_{1,2}$', r'$\alpha_{2,2}$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+    'FS': dict(
+        names=NAMES_FS,
+        scale=[1e6, 1440, 1, 1e6],
+        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
+                r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
-    'B': dict(
-        names=NAMES_B,
-        scale=[1e6, 1440, 1, 1, 1e6, 1440, 1, 1, 1e6, 1440, 1, 1, 1e6],
-        labels=[r'$F_{0,1}\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{min})$',
-                r'$\alpha_{1,1}$', r'$\alpha_{2,1}$',
-                r'$F_{0,2}\ (\mu\mathrm{Jy})$', r'$t_{b,2}\ (\mathrm{min})$',
-                r'$\alpha_{1,2}$', r'$\alpha_{2,2}$',
-                r'$F_{0,3}\ (\mu\mathrm{Jy})$', r'$t_3\ (\mathrm{min})$',
-                r'$k_3$', r'$\alpha_{2,3}$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
-    ),
-    'C': dict(
-        names=NAMES_C,
-        scale=[1e6, 1440, 1, 1, 1e6, 1440, 1440, 1, 1, 1, 1e6, 1440, 1, 1, 1e6],
-        labels=[r'$F_{0,1}\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{min})$',
-                r'$\alpha_{1,1}$', r'$\alpha_{2,1}$',
-                r'$F_{0,2}\ (\mu\mathrm{Jy})$',
-                r'$t_{b1,2}\ (\mathrm{min})$', r'$t_{b2,2}\ (\mathrm{min})$',
-                r'$\alpha_{1,2}$', r'$\alpha_{2,2}$', r'$\alpha_{3,2}$',
-                r'$F_{0,3}\ (\mu\mathrm{Jy})$', r'$t_3\ (\mathrm{min})$',
-                r'$k_3$', r'$\alpha_{2,3}$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
-    ),
-    'D': dict(
-        names=NAMES_D,
-        scale=[1e6, 1440, 1440, 1, 1, 1, 1e6, 1440, 1, 1, 1e6],
-        labels=[r'$F_{0,1}\ (\mu\mathrm{Jy})$',
-                r'$t_{b1a}\ (\mathrm{min})$', r'$t_{b1b}\ (\mathrm{min})$',
-                r'$\alpha_{1,1}$', r'$\alpha_{2,1}$', r'$\alpha_{3,1}$',
-                r'$F_{0,2}\ (\mu\mathrm{Jy})$', r'$t_{b,2}\ (\mathrm{min})$',
-                r'$\alpha_{1,2}$', r'$\alpha_{2,2}$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+    'SHIFT': dict(
+        names=NAMES_SHIFT,
+        scale=[1e6, 1, 1, 1, 1, 1, 1e6],
+        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{d})$',
+                r'$t_{b,2}\ (\mathrm{d})$', r'$\alpha_1$', r'$\alpha_2$',
+                r'$\alpha_3$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
 }
 
@@ -584,7 +335,7 @@ def save_corner(tag, flat_chain):
 # Plotting helpers  (reference x_plot/y_plot/ye_plot as module globals
 #                    set inside __main__ before these are ever called)
 # ---------------------------------------------------------------
-MODEL_COLOR = {'A': 'crimson', 'B': 'royalblue', 'C': 'darkorange', 'D': 'darkorchid'}
+MODEL_COLOR = {'FS': 'royalblue'}
 
 def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
     pos          = y_plot > 0
@@ -624,29 +375,206 @@ def add_minutes_axis(ax):
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
 def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
-    # Restrict to t>0 for log-scale residual plot
-    pos_fit   = mask_used & (y_plot > 0) & (x_plot > 0)
-    ymod_data = model_fn(x_plot[pos_fit], *params_best)
-    resid     = (y_plot[pos_fit] - ymod_data) / ye_plot[pos_fit]
+    visible  = (x_plot >= 1e-4) & (x_plot <= 13) & (y_plot > 0)
+    pos_fit  = mask_used & visible
+    pos_excl = ~mask_used & visible
+
     ax_res.axhline(0,  color=line_color, lw=1.2, zorder=5)
     ax_res.axhline( 3, color='gray', lw=0.8, ls='--', alpha=0.5)
     ax_res.axhline(-3, color='gray', lw=0.8, ls='--', alpha=0.5)
-    ax_res.errorbar(x_plot[pos_fit], resid, yerr=np.ones_like(resid),
-                    fmt='.', color='black', markersize=3, elinewidth=0.4,
-                    alpha=0.8, capsize=0, zorder=2)
-    ax_res.set_xscale('log'); ax_res.set_xlim(1e-4, 13); ax_res.set_ylim(-7, 7)
+
+    all_resid = []
+    if pos_excl.any():
+        ymod_excl = model_fn(x_plot[pos_excl], *params_best)
+        resid_excl = (y_plot[pos_excl] - ymod_excl) / ye_plot[pos_excl]
+        all_resid.append(resid_excl)
+        ax_res.errorbar(x_plot[pos_excl], resid_excl, yerr=np.ones_like(resid_excl),
+                        fmt='.', color='gray', markersize=2, elinewidth=0.3,
+                        alpha=0.45, capsize=0, zorder=1.5, label='Excluded')
+    if pos_fit.any():
+        ymod_fit = model_fn(x_plot[pos_fit], *params_best)
+        resid_fit = (y_plot[pos_fit] - ymod_fit) / ye_plot[pos_fit]
+        all_resid.append(resid_fit)
+        ax_res.errorbar(x_plot[pos_fit], resid_fit, yerr=np.ones_like(resid_fit),
+                        fmt='.', color='black', markersize=3, elinewidth=0.4,
+                        alpha=0.8, capsize=0, zorder=2, label='Fitted')
+
+    if all_resid:
+        resid_abs = np.abs(np.concatenate(all_resid))
+        finite = resid_abs[np.isfinite(resid_abs)]
+        ymax = max(7.0, min(30.0, 1.2 * np.percentile(finite, 99))) if len(finite) else 7.0
+    else:
+        ymax = 7.0
+    ax_res.set_xscale('log'); ax_res.set_xlim(1e-4, 13); ax_res.set_ylim(-ymax, ymax)
     ax_res.set_xlabel('Days post-burst', fontsize=11)
     ax_res.set_ylabel('Residuals (σ)', fontsize=10)
+    ax_res.legend(fontsize=7, loc='upper right')
     ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
 
-def save_background_plot(bg_models):
-    """Dedicated plot of the TESS background polynomial for all three models.
+def compute_effective_t90(x, excess, t_min, t_max):
+    """Return T05 offset, effective T90, and T95 for positive excess fluence."""
+    sel = (x >= t_min) & (x <= t_max) & np.isfinite(excess) & (excess > 0)
+    tx = x[sel]
+    fx = excess[sel]
+    if len(tx) < 2:
+        return t_min, 0.0, t_min
 
-    bg_models: list of (tag, chain, lp, theta_fn) — same order as MODELS.
+    order = np.argsort(tx)
+    tx = tx[order]
+    fx = fx[order]
+    edges = np.empty(len(tx) + 1)
+    edges[1:-1] = 0.5 * (tx[:-1] + tx[1:])
+    edges[0] = max(t_min, tx[0] - 0.5 * (tx[1] - tx[0]))
+    edges[-1] = min(t_max, tx[-1] + 0.5 * (tx[-1] - tx[-2]))
+    dt = np.maximum(np.diff(edges), 0.0)
+    cumulative = np.cumsum(fx * dt)
+    total = cumulative[-1]
+    if not np.isfinite(total) or total <= 0:
+        return t_min, 0.0, t_min
+
+    t05 = np.interp(0.05 * total, cumulative, tx)
+    t95 = np.interp(0.95 * total, cumulative, tx)
+    return t05, t95 - t05, t95
+
+def save_shifted_excess_plot(model_fn, params_best, tburst_offset, t90_eff):
+    """Plot positive Data - Model excess versus computed shifted time."""
+    t_shift = x_plot - tburst_offset
+    in_win  = (t_shift > 0) & (t_shift <= SHIFT_PLOT_MAX)
+    ymod    = model_fn(x_plot[in_win], *params_best)
+    excess  = y_plot[in_win] - ymod
+    e_excess = ye_plot[in_win]
+    x_excess = t_shift[in_win]
+
+    pos = excess > 0
+    n_omit = int((~pos).sum())
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    if pos.any():
+        ax.errorbar(x_excess[pos], excess[pos], yerr=e_excess[pos],
+                    fmt='.', color='black', markersize=3, elinewidth=0.4,
+                    alpha=0.8, capsize=0, label='Data - model')
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlim(max(x_excess[pos].min() * 0.8, 1e-5) if pos.any() else 1e-5, 1.0)
+    if pos.any():
+        ax.set_ylim(max(e_excess[pos].min() * 0.3, excess[pos].min() * 0.5),
+                    excess[pos].max() * 2.0)
+    ax.set_xlabel(f'Days after T$_0$ + {tburst_offset:.5f} d', fontsize=11)
+    ax.set_ylabel('Data - Model (Jy)', fontsize=11)
+    ax.grid(True, which='both', alpha=0.2, lw=0.5)
+    ax.legend(fontsize=8, loc='best')
+    ax.set_title(f'Positive excess after forward-shock subtraction  '
+                 f'(T90={t90_eff:.3f} d; {n_omit} non-positive points omitted)', fontsize=10)
+    plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
+    plt.tight_layout()
+    plt.savefig('GRB260207A_shifted_excess.png', dpi=130, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: GRB260207A_shifted_excess.png  "
+          f"(positive points={int(pos.sum())}, omitted non-positive={n_omit})")
+
+def save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot,
+                            fit_mask_plot, chain, lp, chi2_r,
+                            tburst_offset, t90_eff):
+    p_best = theta_to_params_shift(chain[np.argmax(lp)])
+    t_model = np.logspace(np.log10(max(x_shift_plot[x_shift_plot > 0].min() * 0.8, 1e-5)),
+                          np.log10(SHIFT_PLOT_MAX), 1200)
+
+    fig, (ax, ax_res) = plt.subplots(
+        2, 1, figsize=(8, 9),
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
+
+    pos_data = y_shift_plot > 0
+    fit_pos = fit_mask_plot & pos_data
+    excl_pos = ~fit_mask_plot & pos_data
+    fit_nonpos = fit_mask_plot & ~pos_data
+    excl_nonpos = ~fit_mask_plot & ~pos_data
+    if excl_pos.any():
+        ax.errorbar(x_shift_plot[excl_pos], y_shift_plot[excl_pos],
+                    yerr=ye_shift_plot[excl_pos], fmt='.', color='gray',
+                    markersize=2, elinewidth=0.3, alpha=0.45, capsize=0,
+                    label='Excluded')
+    if fit_pos.any():
+        ax.errorbar(x_shift_plot[fit_pos], y_shift_plot[fit_pos],
+                    yerr=ye_shift_plot[fit_pos], fmt='.', color='black',
+                    markersize=3, elinewidth=0.4, alpha=0.8, capsize=0,
+                    label='Fitted')
+    if (fit_nonpos | excl_nonpos).any():
+        nonpos_x = np.concatenate([x_shift_plot[excl_nonpos], x_shift_plot[fit_nonpos]])
+        nonpos_y = np.concatenate([np.abs(y_shift_plot[excl_nonpos]),
+                                   np.abs(y_shift_plot[fit_nonpos])])
+        nonpos_ye = np.concatenate([ye_shift_plot[excl_nonpos],
+                                    ye_shift_plot[fit_nonpos]])
+        if len(nonpos_x):
+            ax.errorbar(nonpos_x, nonpos_y, yerr=nonpos_ye, fmt='.',
+                        color='lightgray', markersize=2, elinewidth=0.3,
+                        alpha=0.35, capsize=0, label='Non-positive residuals (abs)')
+    ax.axvline(SHIFT_FIT_MAX, color='gray', ls='--', lw=0.9, alpha=0.6,
+               label=f'Fit limit: {SHIFT_FIT_MAX:.2f} d')
+
+    rng = np.random.default_rng(46)
+    for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
+        y_samp = model_shifted_excess(t_model, *theta_to_params_shift(chain[i]))
+        ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
+                '-', color='darkorange', lw=0.3, alpha=0.04, zorder=4)
+
+    y_best = model_shifted_excess(t_model, *p_best)
+    ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
+            '-', color='darkorange', lw=2.0, zorder=6,
+            label=f'Best fit  chi2_r={chi2_r:.2f}')
+    for (clabel, cy, ls, ccolor, desc) in get_components_shift(t_model, p_best):
+        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
+                color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
+
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlim(t_model.min(), SHIFT_PLOT_MAX)
+    vis = pos_data & np.isfinite(y_shift_plot)
+    if vis.any():
+        ax.set_ylim(max(ye_shift_plot[vis].min() * 0.3, y_shift_plot[vis].min() * 0.5),
+                    y_shift_plot[vis].max() * 2.0)
+    ax.set_ylabel('Data - Forward Shock (Jy)', fontsize=11)
+    ax.set_title(f'Shifted excess: DSBPL + constant background  '
+                 f'(T90={t90_eff:.3f} d)', fontsize=10)
+    ax.legend(fontsize=6.5, loc='best')
+    ax.grid(True, which='both', alpha=0.2, lw=0.5)
+    ax.tick_params(labelbottom=False)
+
+    ymod_data = model_shifted_excess(x_shift_plot, *p_best)
+    resid = (y_shift_plot - ymod_data) / ye_shift_plot
+    ax_res.axhline(0, color='darkorange', lw=1.2, zorder=5)
+    ax_res.axhline( 3, color='gray', lw=0.8, ls='--', alpha=0.5)
+    ax_res.axhline(-3, color='gray', lw=0.8, ls='--', alpha=0.5)
+    ax_res.errorbar(x_shift_plot[~fit_mask_plot], resid[~fit_mask_plot],
+                    yerr=np.ones_like(resid[~fit_mask_plot]),
+                    fmt='.', color='gray', markersize=2, elinewidth=0.3,
+                    alpha=0.45, capsize=0)
+    ax_res.errorbar(x_shift_plot[fit_mask_plot], resid[fit_mask_plot],
+                    yerr=np.ones_like(resid[fit_mask_plot]),
+                    fmt='.', color='black', markersize=3, elinewidth=0.4,
+                    alpha=0.8, capsize=0)
+    ax_res.axvline(SHIFT_FIT_MAX, color='gray', ls='--', lw=0.9, alpha=0.6)
+    finite = np.abs(resid[np.isfinite(resid)])
+    ymax = max(7.0, min(30.0, 1.2 * np.percentile(finite, 99))) if len(finite) else 7.0
+    ax_res.set_xscale('log')
+    ax_res.set_xlim(t_model.min(), SHIFT_PLOT_MAX)
+    ax_res.set_ylim(-ymax, ymax)
+    ax_res.set_xlabel(f'Days after T$_0$ + {tburst_offset:.5f} d', fontsize=11)
+    ax_res.set_ylabel('Residuals (sigma)', fontsize=10)
+    ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
+
+    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
+    plt.savefig('GRB260207A_shifted_excess_dsbpl.png', dpi=130, bbox_inches='tight')
+    plt.close()
+    print("Saved: GRB260207A_shifted_excess_dsbpl.png")
+
+def save_background_plot(bg_models):
+    """Dedicated plot of the TESS background constant.
+
+    bg_models: list of (tag, chain, lp, theta_fn).
     Uses module globals x_plot / y_plot / ye_plot (full mask_plot range).
-    Shows linear x-axis so the pre-burst region and the full polynomial
-    shape are visible. y-axis uses symlog so both the bright afterglow and
-    the low-level background polynomial are legible simultaneously.
+    Shows linear x-axis so the pre-burst region and the full background
+    level are visible. y-axis uses symlog so both the bright afterglow and
+    the low-level background are legible simultaneously.
     """
     t_bg = np.linspace(x_plot.min() - 0.02, x_plot.max() + 0.3, 2000)
 
@@ -665,7 +593,7 @@ def save_background_plot(bg_models):
     # --- posterior samples + best-fit constant background --------
     rng = np.random.default_rng(0)
     for tag, chain, lp, theta_fn in bg_models:
-        color = MODEL_COLOR[tag]
+        color = MODEL_COLOR.get(tag, MODEL_COLOR['FS'])
         idx   = rng.choice(len(chain), min(300, len(chain)), replace=False)
         for i in idx:
             p   = theta_fn(chain[i])
@@ -673,7 +601,7 @@ def save_background_plot(bg_models):
         p_best = theta_fn(chain[np.argmax(lp)])
         C_bg   = p_best[-1]
         ax.axhline(C_bg, color=color, lw=2, zorder=5,
-                   label=f'Model {tag}  C_bg={C_bg*1e6:.2f} µJy')
+                   label=f'{tag}  C_bg={C_bg*1e6:.2f} µJy')
 
     # --- cosmetic -------------------------------------------------
     ax.axvline(0, color='gray', ls='--', lw=0.8, alpha=0.6, zorder=4)
@@ -681,7 +609,7 @@ def save_background_plot(bg_models):
     ax.text(0.003, 0.97, 'trigger', transform=ax.transAxes,
             va='top', fontsize=8, color='gray')
 
-    # linthresh at rough noise floor so polynomial detail is in the linear region
+    # linthresh at rough noise floor so background detail is in the linear region
     linthresh = max(float(np.median(ye_plot)), 1e-7)
     ax.set_yscale('symlog', linthresh=linthresh)
     ax.set_xlim(x_plot.min() - 0.02, x_plot.max() + 0.3)
@@ -842,184 +770,125 @@ if __name__ == '__main__':
         print("Saved: GRB260207A_data_only.png")
         raise SystemExit(0)
 
-    # Full fit range: 1 d pre-burst through 2 d; background and SBPLs both see this range
-    mask_fit = (x_plot >= -1.0) & (x_plot <= 2.0)
+    # Fit only through 0.02 d post-burst, keeping pre-burst data for background.
+    mask_fit = (x_plot >= -1.0) & (x_plot <= FS_FIT_MAX)
     xD = x_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
     print(f"N_fit = {len(xD)},  t in [{xD.min()*1440:.2f} min, {xD.max():.3f} d]")
 
-    # -----------------------------------------------------------
-    # Run all three models in parallel
-    # -----------------------------------------------------------
     mode_str = "quick" if args.quick else "adaptive (convergence-based)"
-    print(f"\nLaunching Models A, B, C, D in parallel (4 worker processes, {mode_str})...")
-    with ProcessPoolExecutor(max_workers=4) as ex:
-        fut_A = ex.submit(_fit_A, xD, yD, yeD, args.quick)
-        fut_B = ex.submit(_fit_B, xD, yD, yeD, args.quick)
-        fut_C = ex.submit(_fit_C, xD, yD, yeD, args.quick)
-        fut_D = ex.submit(_fit_D, xD, yD, yeD, args.quick)
-        chainA, lpA = fut_A.result()
-        chainB, lpB = fut_B.result()
-        chainC, lpC = fut_C.result()
-        chainD, lpD = fut_D.result()
+    print(f"\nLaunching forward-shock fit ({mode_str})...")
+    chainFS, lpFS = _fit_FS(xD, yD, yeD, args.quick)
 
     # -----------------------------------------------------------
     # Summarize
     # -----------------------------------------------------------
-    thetaA, pA, qA = summarize(chainA, lpA, theta_to_params_A, NAMES_A)
-    thetaB, pB, qB = summarize(chainB, lpB, theta_to_params_B, NAMES_B)
-    thetaC, pC, qC = summarize(chainC, lpC, theta_to_params_C, NAMES_C)
-    thetaD, pD, qD = summarize(chainD, lpD, theta_to_params_D, NAMES_D)
+    thetaFS, pFS, qFS = summarize(chainFS, lpFS, theta_to_params_FS, NAMES_FS)
 
     N = len(xD)
-    chi2_A  = -2*np.max(lpA);  chi2_rA = chi2_A / (N -  9);  bic_A = chi2_A +  9*np.log(N)
-    chi2_B  = -2*np.max(lpB);  chi2_rB = chi2_B / (N - 13);  bic_B = chi2_B + 13*np.log(N)
-    chi2_C  = -2*np.max(lpC);  chi2_rC = chi2_C / (N - 15);  bic_C = chi2_C + 15*np.log(N)
-    chi2_D  = -2*np.max(lpD);  chi2_rD = chi2_D / (N - 11);  bic_D = chi2_D + 11*np.log(N)
+    npar = len(NAMES_FS)
+    chi2_FS  = -2*np.max(lpFS)
+    chi2_rFS = chi2_FS / (N - npar)
+    decay_best = decay_alpha_from_p(pFS[2])
 
-    print_params('A', thetaA, NAMES_A, qA,
-                 ['F0_1 (uJy)', 'tb_1 (min)', 'a1_1', 'a2_1',
-                  'F0_2 (uJy)', 'tb_2 (min)', 'a1_2', 'a2_2',
-                  'C_bg (uJy)'],
-                 [1e6, 1440, 1, 1, 1e6, 1440, 1, 1, 1e6],
-                 chi2_rA, bic_A)
-
-    print_params('B', thetaB, NAMES_B, qB,
-                 ['F0_1 (uJy)', 'tb_1 (min)', 'a1_1', 'a2_1',
-                  'F0_2 (uJy)', 'tb_2 (min)', 'a1_2', 'a2_2',
-                  'F0_3 (uJy)', 't3 (min)',   'k3',   'a2_3',
-                  'C_bg (uJy)'],
-                 [1e6, 1440, 1, 1, 1e6, 1440, 1, 1, 1e6, 1440, 1, 1, 1e6],
-                 chi2_rB, bic_B)
-
-    print_params('C', thetaC, NAMES_C, qC,
-                 ['F0_1 (uJy)', 'tb_1 (min)', 'a1_1', 'a2_1',
-                  'F0_2 (uJy)', 'tb2a (min)', 'tb2b (min)',
-                  'a1_2', 'a2_2', 'a3_2',
-                  'F0_3 (uJy)', 't3 (min)', 'k3', 'a2_3',
-                  'C_bg (uJy)'],
-                 [1e6, 1440, 1, 1, 1e6, 1440, 1440, 1, 1, 1, 1e6, 1440, 1, 1, 1e6],
-                 chi2_rC, bic_C)
-
-    print_params('D', thetaD, NAMES_D, qD,
-                 ['F0_1 (uJy)', 'tb1a (min)', 'tb1b (min)', 'a1_1', 'a2_1', 'a3_1',
-                  'F0_2 (uJy)', 'tb_2 (min)', 'a1_2', 'a2_2',
-                  'C_bg (uJy)'],
-                 [1e6, 1440, 1440, 1, 1, 1, 1e6, 1440, 1, 1, 1e6],
-                 chi2_rD, bic_D)
-
-    print(f"\n=== MODEL COMPARISON  (N={N}, t in [-1.0, 2.0] d) ===")
-    print(f"  Model A   9 params   chi2_r={chi2_rA:.3f}   BIC={bic_A:.1f}")
-    print(f"  Model B  13 params   chi2_r={chi2_rB:.3f}   BIC={bic_B:.1f}")
-    print(f"  Model C  15 params   chi2_r={chi2_rC:.3f}   BIC={bic_C:.1f}")
-    print(f"  Model D  11 params   chi2_r={chi2_rD:.3f}   BIC={bic_D:.1f}")
-    print(f"  Delta_BIC(B-A)={bic_B-bic_A:.1f}   Delta_BIC(C-A)={bic_C-bic_A:.1f}"
-          f"   Delta_BIC(D-A)={bic_D-bic_A:.1f}")
+    print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
+                 ['F0 (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
+                 [1e6, 1440, 1, 1e6],
+                 chi2_rFS)
+    print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
+    print(f"  {'decay slope':>24s}:    {-decay_best: .3f}   "
+          f"(fixed by best-fit p as -3(p-1)/4)")
 
     # -----------------------------------------------------------
-    # Corner plots
+    # Corner plot
     # -----------------------------------------------------------
-    save_corner('A', chainA)
-    save_corner('B', chainB)
-    save_corner('C', chainC)
-    save_corner('D', chainD)
+    save_corner('FS', chainFS)
 
     # -----------------------------------------------------------
-    # Individual model figures (main panel + residuals)
+    # Model figure (main panel + residuals)
     # -----------------------------------------------------------
     t_model = np.logspace(np.log10(2e-4), np.log10(13), 1500)
+    p_best = theta_to_params_FS(chainFS[np.argmax(lpFS)])
+    color  = MODEL_COLOR['FS']
 
-    MODELS = [
-        ('A', chainA, lpA, theta_to_params_A, model_A, get_components_A,
-         chi2_rA,  9, 'Model A: SBPL+SBPL+bg, S=0.1'),
-        ('B', chainB, lpB, theta_to_params_B, model_B, get_components_B,
-         chi2_rB, 13, 'Model B: SBPL+SBPL+sigmoid×PL(flare)+bg'),
-        ('C', chainC, lpC, theta_to_params_C, model_C, get_components_C,
-         chi2_rC, 15, 'Model C: SBPL+DSBPL+sigmoid×PL(flare)+bg, P1:S=0.1 P2:S=0.02'),
-        ('D', chainD, lpD, theta_to_params_D, model_D, get_components_D,
-         chi2_rD, 11, 'Model D: DSBPL+SBPL+bg, S=0.1'),
-    ]
+    fig, (ax, ax_res) = plt.subplots(
+        2, 1, figsize=(8, 9),
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
 
-    for (tag, chain, lp, theta_fn, mfn, comp_fn, chi2_r, ndof, title) in MODELS:
-        p_best = theta_fn(chain[np.argmax(lp)])
-        color  = MODEL_COLOR[tag]
+    add_data_to_ax(ax, mask_fit)
 
-        fig, (ax, ax_res) = plt.subplots(
-            2, 1, figsize=(8, 9),
-            gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
+    rng = np.random.default_rng(42)
+    for i in rng.choice(len(chainFS), min(200, len(chainFS)), replace=False):
+        ax.plot(t_model, model_FS(t_model, *theta_to_params_FS(chainFS[i])),
+                '-', color=color, lw=0.3, alpha=0.04, zorder=4)
 
-        add_data_to_ax(ax, mask_fit)
+    ax.plot(t_model, model_FS(t_model, *p_best), '-', color=color, lw=2.0, zorder=6,
+            label=f'Best fit  chi2_r={chi2_rFS:.2f}')
+    for (clabel, cy, ls, ccolor, desc) in get_components_FS(t_model, p_best):
+        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
+                color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
 
-        rng = np.random.default_rng(42)
-        for i in rng.choice(len(chain), 200, replace=False):
-            ax.plot(t_model, mfn(t_model, *theta_fn(chain[i])),
-                    '-', color=color, lw=0.3, alpha=0.04, zorder=4)
+    format_main_ax(ax)
+    ax.tick_params(labelbottom=False)
+    ax.set_ylabel('Flux density (Jy)', fontsize=11)
+    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
+    ax.legend(fontsize=6.5, loc='lower left')
+    add_minutes_axis(ax)
+    plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
 
-        ax.plot(t_model, mfn(t_model, *p_best), '-', color=color, lw=2.0, zorder=6,
-                label=f'Best fit  chi2_r={chi2_r:.2f}')
-        for (clabel, cy, ls, ccolor, desc) in comp_fn(t_model, p_best):
-            ax.plot(t_model, np.where(cy > 0, cy, np.nan),
-                    color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
-
-        format_main_ax(ax)
-        ax.tick_params(labelbottom=False)
-        ax.set_ylabel('Flux density (Jy)', fontsize=11)
-        ax.set_title(title, fontsize=10)
-        ax.legend(fontsize=6.5, loc='lower left')
-        add_minutes_axis(ax)
-        plot_residuals(ax_res, mask_fit, mfn, p_best, color)
-
-        plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
-        plt.savefig(f'GRB260207A_emcee_{tag}.png', dpi=130, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: GRB260207A_emcee_{tag}.png")
-
-    # -----------------------------------------------------------
-    # Comparison figure
-    # -----------------------------------------------------------
-    bic_by_tag = {'A': bic_A, 'B': bic_B, 'C': bic_C, 'D': bic_D}
-
-    fig_cmp = plt.figure(figsize=(16, 9))
-    gs = gridspec.GridSpec(2, 4, figure=fig_cmp,
-                           height_ratios=[3, 1], hspace=0.08, wspace=0.08)
-    ax_main = fig_cmp.add_subplot(gs[0, :])
-    ax_rA   = fig_cmp.add_subplot(gs[1, 0])
-    ax_rB   = fig_cmp.add_subplot(gs[1, 1])
-    ax_rC   = fig_cmp.add_subplot(gs[1, 2])
-    ax_rD   = fig_cmp.add_subplot(gs[1, 3])
-
-    add_data_to_ax(ax_main, mask_fit, alpha_excl=0.25)
-    for (tag, chain, lp, theta_fn, mfn, _, chi2_r, _, _) in MODELS:
-        p_best = theta_fn(chain[np.argmax(lp)])
-        ax_main.plot(t_model, mfn(t_model, *p_best), '-',
-                     color=MODEL_COLOR[tag], lw=2.0, zorder=6,
-                     label=f'Model {tag}  chi2_r={chi2_r:.2f}  BIC={bic_by_tag[tag]:.0f}')
-
-    format_main_ax(ax_main)
-    ax_main.tick_params(labelbottom=False)
-    ax_main.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax_main.legend(fontsize=8, loc='lower left')
-    add_minutes_axis(ax_main)
-
-    for ax_res, (tag, chain, lp, theta_fn, mfn, _, chi2_r, _, _) in zip(
-            [ax_rA, ax_rB, ax_rC, ax_rD], MODELS):
-        p_best = theta_fn(chain[np.argmax(lp)])
-        plot_residuals(ax_res, mask_fit, mfn, p_best, MODEL_COLOR[tag])
-        ax_res.set_title(f'Model {tag}', fontsize=9)
-        if tag != 'A':
-            ax_res.set_ylabel('')
-            ax_res.tick_params(labelleft=False)
-
-    plt.suptitle('GRB 260207A — Model Comparison', fontsize=13, y=0.995)
-    plt.savefig('GRB260207A_emcee_compare.png', dpi=130, bbox_inches='tight')
+    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
+    plt.savefig('GRB260207A_emcee_forward_shock.png', dpi=130, bbox_inches='tight')
     plt.close()
-    print("Saved: GRB260207A_emcee_compare.png")
+    print("Saved: GRB260207A_emcee_forward_shock.png")
+
+    # -----------------------------------------------------------
+    # Shifted positive-excess plot: Data - Model, with computed tburst offset
+    # -----------------------------------------------------------
+    fs_subtracted = y_plot - model_FS(x_plot, *p_best)
+    timing_max = FS_FIT_MAX + SHIFT_FIT_MAX
+    tburst_offset, t90_eff, t95_eff = compute_effective_t90(
+        x_plot, fs_subtracted, 0.0, timing_max)
+    print(f"\nEffective shifted-excess timing: "
+          f"tburst_offset=T05={tburst_offset:.5f} d, "
+          f"T90={t90_eff:.5f} d, T95={t95_eff:.5f} d "
+          f"(computed over t=[0,{timing_max:.3f}] d)")
+    save_shifted_excess_plot(model_FS, p_best, tburst_offset, t90_eff)
+
+    # -----------------------------------------------------------
+    # Fit shifted excess with DSBPL + constant background
+    # -----------------------------------------------------------
+    t_shift_all = x_plot - tburst_offset
+    mask_shift_plot = (t_shift_all > 0) & (t_shift_all <= SHIFT_PLOT_MAX)
+    mask_shift_fit = mask_shift_plot & (t_shift_all <= SHIFT_FIT_MAX)
+    x_shift_plot = t_shift_all[mask_shift_plot]
+    y_shift_plot = y_plot[mask_shift_plot] - model_FS(x_plot[mask_shift_plot], *p_best)
+    ye_shift_plot = ye_plot[mask_shift_plot]
+    fit_mask_plot = t_shift_all[mask_shift_plot] <= SHIFT_FIT_MAX
+    x_shift = t_shift_all[mask_shift_fit]
+    y_shift = y_plot[mask_shift_fit] - model_FS(x_plot[mask_shift_fit], *p_best)
+    ye_shift = ye_plot[mask_shift_fit]
+    print(f"\nN_shift_fit = {len(x_shift)},  shifted t in "
+          f"[{x_shift.min():.5f}, {x_shift.max():.3f}] d")
+    print(f"N_shift_plot = {len(x_shift_plot)},  shifted t in "
+          f"[{x_shift_plot.min():.5f}, {x_shift_plot.max():.3f}] d")
+    print(f"Launching shifted-excess DSBPL fit ({mode_str})...")
+    chainShift, lpShift = _fit_shift(x_shift, y_shift, ye_shift, args.quick)
+
+    thetaShift, pShift, qShift = summarize(chainShift, lpShift,
+                                           theta_to_params_shift, NAMES_SHIFT)
+    chi2_shift = -2*np.max(lpShift)
+    chi2_rShift = chi2_shift / (len(x_shift) - len(NAMES_SHIFT))
+    print_params('SHIFTED EXCESS DSBPL MODEL', thetaShift, NAMES_SHIFT, qShift,
+                 ['F0 (uJy)', 'tb1 (d)', 'tb2 (d)', 'a1', 'a2', 'a3', 'C_bg (uJy)'],
+                 [1e6, 1, 1, 1, 1, 1, 1e6],
+                 chi2_rShift)
+    save_corner('SHIFT', chainShift)
+    save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot, fit_mask_plot,
+                            chainShift, lpShift, chi2_rShift,
+                            tburst_offset, t90_eff)
 
     # -----------------------------------------------------------
     # TESS background plot
     # -----------------------------------------------------------
     save_background_plot([
-        ('A', chainA, lpA, theta_to_params_A),
-        ('B', chainB, lpB, theta_to_params_B),
-        ('C', chainC, lpC, theta_to_params_C),
-        ('D', chainD, lpD, theta_to_params_D),
+        ('Forward shock', chainFS, lpFS, theta_to_params_FS),
     ])
