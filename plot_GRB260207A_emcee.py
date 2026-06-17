@@ -32,6 +32,7 @@ WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
 SHIFT_FIT_MAX = 0.08         # days after computed shifted origin for DSBPL fit
 SHIFT_PLOT_MAX = 1.0         # days after computed shifted origin for DSBPL plot
+COMBINED_FIT_MAX = 1.0       # days post-burst for combined FS+DSBPL fit
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
@@ -137,16 +138,18 @@ def get_components_FS(t, p):
 theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), 2.25, -4.5])
 
 # ===============================================================
-# Shifted excess model — DSBPL + constant background
-# theta: [logF0, logTb1, logTb2, a1, a2, a3, logC_bg]
+# Shifted excess model — DSBPL only
+# The forward-shock subtraction already removes the fitted C_bg, so adding a
+# second constant here double-counts the background.
+# theta: [logF0, logTb1, logTb2, a1, a2, a3]
 # ===============================================================
 S_SHIFT = 0.02
 
-def model_shifted_excess(t, F0, tb1, tb2, a1, a2, a3, C_bg):
+def model_shifted_excess(t, F0, tb1, tb2, a1, a2, a3):
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
     comp = np.where(pos, dsbpl(ts, F0, tb1, tb2, a1, a2, a3, S_SHIFT), 0.0)
-    return comp + C_bg
+    return comp
 
 PRIOR_SHIFT = {
     'logF0':   (-6.5, -2.5),
@@ -155,7 +158,6 @@ PRIOR_SHIFT = {
     'a1':      (-8.0,  0.0),
     'a2':      (-2.0,  5.0),
     'a3':      ( 0.2, 12.0),
-    'logC_bg': (-10.0, -3.0),
 }
 NAMES_SHIFT = list(PRIOR_SHIFT.keys())
 
@@ -166,8 +168,8 @@ def log_prior_shift(theta):
     return 0.0
 
 def theta_to_params_shift(theta):
-    logF0, logTb1, logTb2, a1, a2, a3, logC_bg = theta
-    return (10**logF0, 10**logTb1, 10**logTb2, a1, a2, a3, 10**logC_bg)
+    logF0, logTb1, logTb2, a1, a2, a3 = theta
+    return (10**logF0, 10**logTb1, 10**logTb2, a1, a2, a3)
 
 def log_prob_shift(theta, x, y, yerr):
     lp = log_prior_shift(theta)
@@ -181,16 +183,113 @@ def get_components_shift(t, p):
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
     comp = np.where(pos, dsbpl(ts, p[0], p[1], p[2], p[3], p[4], p[5], S_SHIFT), 0.0)
-    cbg = np.full_like(t, p[6])
     return [
         ('DSBPL excess', comp, '--', 'darkorange',
          f"tb=({p[1]:.3f},{p[2]:.3f}) d  alpha=({p[3]:.2f},{p[4]:.2f},{p[5]:.2f})"),
-        ('bg', cbg, '-.', 'mediumseagreen',
-         f"C_bg={p[6]*1e6:.2f} uJy"),
     ]
 
 theta0_SHIFT = np.array([np.log10(3e-4), np.log10(0.015), np.log10(0.035),
-                         -3.0, 1.0, 3.0, -5.0])
+                         -3.0, 1.0, 3.0])
+
+# ===============================================================
+# Combined trigger-frame model — FS SBPL + DSBPL(t - t0_D) + C_bg
+# theta: [logF0_FS, logTb_FS, p, logF0_D, t0_D, logTauB1_D,
+#         logTauB2_D, a1_D, a2_D, a3_D, logC_bg]
+# ===============================================================
+COMBINED_T0_HALF_WIDTH = 0.02
+PRIOR_COMBINED = {
+    'logF0_FS':  (-6.0, -2.3),
+    'logTb_FS':  (-2.523, -1.699),
+    'p':         ( 2.1,  2.5),
+    'logF0_D':   (-8.0, -2.0),
+    't0_D':      ( 0.0,  0.08),
+    'logTauB1_D': (np.log10(0.003), np.log10(0.08)),
+    'logTauB2_D': (np.log10(0.006), np.log10(0.20)),
+    'a1_D':      (-8.0,  0.0),
+    'a2_D':      (-2.0,  5.0),
+    'a3_D':      ( 0.2, 12.0),
+    'logC_bg':   (-10.0, -2.0),
+}
+NAMES_COMBINED = list(PRIOR_COMBINED.keys())
+
+def set_combined_t0_prior(t0_center):
+    lo = max(0.0, float(t0_center) - COMBINED_T0_HALF_WIDTH)
+    hi = float(t0_center) + COMBINED_T0_HALF_WIDTH
+    PRIOR_COMBINED['t0_D'] = (lo, hi)
+
+def model_combined(t, F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D,
+                   a1_D, a2_D, a3_D, C_bg):
+    fs = model_FS(t, F0_FS, tb_FS, p_FS, C_bg)
+    tau = t - t0_D
+    pos = tau > 0
+    tau_eval = np.where(pos, tau, 1e-10)
+    ds = np.where(pos, dsbpl(tau_eval, F0_D, tau_b1_D, tau_b2_D,
+                             a1_D, a2_D, a3_D, S_SHIFT), 0.0)
+    return fs + ds
+
+def log_prior_combined(theta):
+    for v, (lo, hi) in zip(theta, PRIOR_COMBINED.values()):
+        if not (lo <= v <= hi): return -np.inf
+    if theta[6] <= theta[5]: return -np.inf
+    return 0.0
+
+def theta_to_params_combined(theta):
+    (logF0_FS, logTb_FS, p_FS, logF0_D, t0_D, logTauB1_D,
+     logTauB2_D, a1_D, a2_D, a3_D, logC_bg) = theta
+    return (10**logF0_FS, 10**logTb_FS, p_FS,
+            10**logF0_D, t0_D, 10**logTauB1_D, 10**logTauB2_D,
+            a1_D, a2_D, a3_D, 10**logC_bg)
+
+def log_prob_combined(theta, x, y, yerr):
+    lp = log_prior_combined(theta)
+    if not np.isfinite(lp): return -np.inf
+    params = theta_to_params_combined(theta)
+    try:    ymod = windowed_eval(model_combined, x, params)
+    except: return -np.inf
+    if not np.all(np.isfinite(ymod)): return -np.inf
+    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
+
+def theta0_combined_from_fits(theta_FS_best, p_shift, t0_D):
+    F0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D = p_shift
+    theta0 = np.array([
+        theta_FS_best[0],
+        theta_FS_best[1],
+        theta_FS_best[2],
+        np.log10(F0_D),
+        t0_D,
+        np.log10(tau_b1_D),
+        np.log10(tau_b2_D),
+        a1_D,
+        a2_D,
+        a3_D,
+        theta_FS_best[3],
+    ])
+    for j, (lo, hi) in enumerate(PRIOR_COMBINED.values()):
+        theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
+    if theta0[6] <= theta0[5]:
+        theta0[6] = min(PRIOR_COMBINED['logTauB2_D'][1] - 1e-4, theta0[5] + 1e-3)
+    return theta0
+
+def get_components_combined(t, p):
+    F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D, C_bg = p
+    pos_fs = t > 0
+    ts = np.where(pos_fs, t, 1e-10)
+    fs = np.where(pos_fs, sbpl(ts, F0_FS, tb_FS, FS_RISE_ALPHA,
+                               decay_alpha_from_p(p_FS), S_AB), 0.0)
+    tau = t - t0_D
+    pos_d = tau > 0
+    tau_eval = np.where(pos_d, tau, 1e-10)
+    ds = np.where(pos_d, dsbpl(tau_eval, F0_D, tau_b1_D, tau_b2_D,
+                             a1_D, a2_D, a3_D, S_SHIFT), 0.0)
+    cbg = np.full_like(t, C_bg)
+    return [
+        ('Forward shock', fs, '--', 'goldenrod',
+         f"tb={tb_FS*1440:.1f} min  rise=+0.50  decay=-{decay_alpha_from_p(p_FS):.2f}"),
+        ('Second peak (combined)', ds, '--', 'darkorange',
+         f"t0={t0_D:.4f} d  tau_b=({tau_b1_D:.3f},{tau_b2_D:.3f}) d  alpha=({a1_D:.2f},{a2_D:.2f},{a3_D:.2f})"),
+        ('TESS bg', cbg, '-.', 'mediumseagreen',
+         f"C_bg={C_bg*1e6:.2f} uJy"),
+    ]
 
 # ---------------------------------------------------------------
 # Generic emcee runner
@@ -261,6 +360,11 @@ def _fit_shift(xD, yD, yeD, quick=False):
     return run_emcee(xD, yD, yeD, theta0_SHIFT, PRIOR_SHIFT, log_prob_shift,
                      'Shifted excess DSBPL', quick=quick)
 
+def _fit_combined(xD, yD, yeD, theta0_combined, quick=False):
+    np.random.seed(52)
+    return run_emcee(xD, yD, yeD, theta0_combined, PRIOR_COMBINED,
+                     log_prob_combined, 'Combined FS+DSBPL', quick=quick)
+
 # ---------------------------------------------------------------
 # Summarize flat chains
 # ---------------------------------------------------------------
@@ -301,10 +405,20 @@ _CORNER_CFG = {
     ),
     'SHIFT': dict(
         names=NAMES_SHIFT,
-        scale=[1e6, 1, 1, 1, 1, 1, 1e6],
+        scale=[1e6, 1, 1, 1, 1, 1],
         labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{d})$',
                 r'$t_{b,2}\ (\mathrm{d})$', r'$\alpha_1$', r'$\alpha_2$',
-                r'$\alpha_3$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+                r'$\alpha_3$'],
+    ),
+    'COMBINED': dict(
+        names=NAMES_COMBINED,
+        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
+        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+                r'$p$', r'$F_{0,\rm D}\ (\mu\mathrm{Jy})$',
+                r'$t_{0,\rm D}\ (\mathrm{d})$',
+                r'$\tau_{b,1,\rm D}\ (\mathrm{d})$', r'$\tau_{b,2,\rm D}\ (\mathrm{d})$',
+                r'$\alpha_{1,\rm D}$', r'$\alpha_{2,\rm D}$',
+                r'$\alpha_{3,\rm D}$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
 }
 
@@ -335,7 +449,7 @@ def save_corner(tag, flat_chain):
 # Plotting helpers  (reference x_plot/y_plot/ye_plot as module globals
 #                    set inside __main__ before these are ever called)
 # ---------------------------------------------------------------
-MODEL_COLOR = {'FS': 'royalblue'}
+MODEL_COLOR = {'FS': 'royalblue', 'COMBINED': 'navy'}
 
 def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
     pos          = y_plot > 0
@@ -533,7 +647,7 @@ def save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot,
         ax.set_ylim(max(ye_shift_plot[vis].min() * 0.3, y_shift_plot[vis].min() * 0.5),
                     y_shift_plot[vis].max() * 2.0)
     ax.set_ylabel('Data - Forward Shock (Jy)', fontsize=11)
-    ax.set_title(f'Shifted excess: DSBPL + constant background  '
+    ax.set_title(f'Shifted excess: DSBPL only  '
                  f'(T90={t90_eff:.3f} d)', fontsize=10)
     ax.legend(fontsize=6.5, loc='best')
     ax.grid(True, which='both', alpha=0.2, lw=0.5)
@@ -566,6 +680,46 @@ def save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot,
     plt.savefig('GRB260207A_shifted_excess_dsbpl.png', dpi=130, bbox_inches='tight')
     plt.close()
     print("Saved: GRB260207A_shifted_excess_dsbpl.png")
+
+def save_combined_plot(mask_combined_fit, chain, lp, chi2_r, tburst_offset):
+    p_best = theta_to_params_combined(chain[np.argmax(lp)])
+    t_model = np.logspace(np.log10(2e-4), np.log10(13), 1500)
+    color = MODEL_COLOR['COMBINED']
+
+    fig, (ax, ax_res) = plt.subplots(
+        2, 1, figsize=(8, 9),
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
+
+    add_data_to_ax(ax, mask_combined_fit)
+
+    rng = np.random.default_rng(52)
+    for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
+        y_samp = model_combined(t_model, *theta_to_params_combined(chain[i]))
+        ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
+                '-', color=color, lw=0.3, alpha=0.04, zorder=4)
+
+    y_best = model_combined(t_model, *p_best)
+    ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
+            '-', color=color, lw=2.0, zorder=6,
+            label=f'Best fit  chi2_r={chi2_r:.2f}')
+    for (clabel, cy, ls, ccolor, desc) in get_components_combined(t_model, p_best):
+        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
+                color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
+
+    ax.axvline(p_best[4], color='dimgray', ls=':', lw=1.1, alpha=0.9,
+               label=f'fitted t0_D={p_best[4]:.4f} d')
+    format_main_ax(ax)
+    ax.tick_params(labelbottom=False)
+    ax.set_ylabel('Flux density (Jy)', fontsize=11)
+    ax.set_title('Combined original-frame model: FS SBPL + second-peak DSBPL', fontsize=10)
+    ax.legend(fontsize=6.2, loc='best')
+    add_minutes_axis(ax)
+    plot_residuals(ax_res, mask_combined_fit, model_combined, p_best, color)
+
+    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
+    plt.savefig('GRB260207A_emcee_combined.png', dpi=130, bbox_inches='tight')
+    plt.close()
+    print("Saved: GRB260207A_emcee_combined.png")
 
 def save_background_plot(bg_models):
     """Dedicated plot of the TESS background constant.
@@ -854,7 +1008,7 @@ if __name__ == '__main__':
     save_shifted_excess_plot(model_FS, p_best, tburst_offset, t90_eff)
 
     # -----------------------------------------------------------
-    # Fit shifted excess with DSBPL + constant background
+    # Fit shifted excess with DSBPL only
     # -----------------------------------------------------------
     t_shift_all = x_plot - tburst_offset
     mask_shift_plot = (t_shift_all > 0) & (t_shift_all <= SHIFT_PLOT_MAX)
@@ -878,8 +1032,8 @@ if __name__ == '__main__':
     chi2_shift = -2*np.max(lpShift)
     chi2_rShift = chi2_shift / (len(x_shift) - len(NAMES_SHIFT))
     print_params('SHIFTED EXCESS DSBPL MODEL', thetaShift, NAMES_SHIFT, qShift,
-                 ['F0 (uJy)', 'tb1 (d)', 'tb2 (d)', 'a1', 'a2', 'a3', 'C_bg (uJy)'],
-                 [1e6, 1, 1, 1, 1, 1, 1e6],
+                 ['F0 (uJy)', 'tb1 (d)', 'tb2 (d)', 'a1', 'a2', 'a3'],
+                 [1e6, 1, 1, 1, 1, 1],
                  chi2_rShift)
     save_corner('SHIFT', chainShift)
     save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot, fit_mask_plot,
@@ -887,8 +1041,53 @@ if __name__ == '__main__':
                             tburst_offset, t90_eff)
 
     # -----------------------------------------------------------
+    # Fit combined original-frame model with the second peak evaluated in
+    # its own tau = t - t0_D frame.
+    # -----------------------------------------------------------
+    set_combined_t0_prior(tburst_offset)
+    theta0_combined = theta0_combined_from_fits(thetaFS, pShift, tburst_offset)
+    print("\nShifted DSBPL used as combined-fit initial guess:")
+    print(f"  {'t0_D':>14s}: {tburst_offset:9.5f} d  "
+          f"(prior [{PRIOR_COMBINED['t0_D'][0]:.5f}, {PRIOR_COMBINED['t0_D'][1]:.5f}] d)")
+    print(f"  {'F0_D':>14s}: {pShift[0]*1e6:9.3f} uJy")
+    print(f"  {'tau_b1_D':>14s}: {pShift[1]:9.5f} d  "
+          f"(trigger {tburst_offset + pShift[1]:.5f} d)")
+    print(f"  {'tau_b2_D':>14s}: {pShift[2]:9.5f} d  "
+          f"(trigger {tburst_offset + pShift[2]:.5f} d)")
+    print(f"  {'a1_D':>14s}: {pShift[3]:9.3f}")
+    print(f"  {'a2_D':>14s}: {pShift[4]:9.3f}")
+    print(f"  {'a3_D':>14s}: {pShift[5]:9.3f}")
+
+    combined_fit_max = COMBINED_FIT_MAX
+    mask_combined_fit = (x_plot >= -1.0) & (x_plot <= combined_fit_max)
+    xC = x_plot[mask_combined_fit]
+    yC = y_plot[mask_combined_fit]
+    yeC = ye_plot[mask_combined_fit]
+    print(f"\nN_combined_fit = {len(xC)},  t in "
+          f"[{xC.min()*1440:.2f} min, {xC.max():.3f} d]")
+    print(f"Launching combined FS+DSBPL fit ({mode_str})...")
+    chainCombined, lpCombined = _fit_combined(xC, yC, yeC, theta0_combined, args.quick)
+
+    thetaCombined, pCombined, qCombined = summarize(
+        chainCombined, lpCombined, theta_to_params_combined, NAMES_COMBINED)
+    chi2_combined = -2*np.max(lpCombined)
+    chi2_rCombined = chi2_combined / (len(xC) - len(NAMES_COMBINED))
+    print_params('COMBINED FS + DSBPL MODEL', thetaCombined, NAMES_COMBINED, qCombined,
+                 ['F0_FS (uJy)', 'tb_FS (min)', 'p',
+                  'F0_D (uJy)', 't0_D (d)', 'tau_b1_D (d)', 'tau_b2_D (d)',
+                  'a1_D', 'a2_D', 'a3_D', 'C_bg (uJy)'],
+                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
+                 chi2_rCombined)
+    print(f"  {'tb1_D trigger':>24s}: {pCombined[4] + pCombined[5]:9.5f} d")
+    print(f"  {'tb2_D trigger':>24s}: {pCombined[4] + pCombined[6]:9.5f} d")
+    save_corner('COMBINED', chainCombined)
+    save_combined_plot(mask_combined_fit, chainCombined, lpCombined,
+                       chi2_rCombined, tburst_offset)
+
+    # -----------------------------------------------------------
     # TESS background plot
     # -----------------------------------------------------------
     save_background_plot([
         ('Forward shock', chainFS, lpFS, theta_to_params_FS),
+        ('COMBINED', chainCombined, lpCombined, theta_to_params_combined),
     ])
