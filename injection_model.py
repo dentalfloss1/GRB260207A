@@ -12,6 +12,7 @@ The background is never multiplied by the energy factor.
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.transforms import blended_transform_factory
 import emcee
 from astropy.time import Time
 
@@ -609,10 +610,8 @@ def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
     pos          = y_plot > 0
     fitted_pos   = mask_used & pos
     excluded_pos = ~mask_used & pos & (x_plot < 13)
-    if (~pos).any():
-        ax.errorbar(x_plot[~pos], np.abs(y_plot[~pos]), yerr=ye_plot[~pos],
-                    fmt='.', color='lightgray', markersize=2, elinewidth=0.4,
-                    alpha=0.3, capsize=0, zorder=1)
+    fitted_nonpos = mask_used & ~pos
+    excluded_nonpos = ~mask_used & ~pos & (x_plot < 13)
     if excluded_pos.any():
         ax.errorbar(x_plot[excluded_pos], y_plot[excluded_pos],
                     yerr=ye_plot[excluded_pos], fmt='.', color='gray',
@@ -622,6 +621,17 @@ def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
                 yerr=ye_plot[fitted_pos], fmt='.', color='black',
                 markersize=3, elinewidth=0.4, alpha=0.8, capsize=0,
                 zorder=2, label='Fitted')
+    floor_trans = blended_transform_factory(ax.transData, ax.transAxes)
+    if excluded_nonpos.any():
+        ax.scatter(x_plot[excluded_nonpos], np.full(excluded_nonpos.sum(), 0.025),
+                   marker='v', s=18, color='gray', alpha=alpha_excl,
+                   transform=floor_trans, clip_on=False, zorder=3,
+                   label='Excluded <= 0')
+    if fitted_nonpos.any():
+        ax.scatter(x_plot[fitted_nonpos], np.full(fitted_nonpos.sum(), 0.025),
+                   marker='v', s=22, color='black', alpha=0.8,
+                   transform=floor_trans, clip_on=False, zorder=4,
+                   label='Fitted <= 0')
     # ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
     #             color='mediumseagreen', markersize=8, elinewidth=1.4,
     #             capsize=4, markeredgecolor='k', markeredgewidth=0.6,
@@ -643,7 +653,7 @@ def add_minutes_axis(ax):
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
 def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
-    visible  = (x_plot >= 1e-4) & (x_plot <= 13) & (y_plot > 0)
+    visible  = (x_plot >= 1e-4) & (x_plot <= 13)
     pos_fit  = mask_used & visible
     pos_excl = ~mask_used & visible
 
@@ -651,21 +661,23 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
     ax_res.axhline( 3, color='gray', lw=0.8, ls='--', alpha=0.5)
     ax_res.axhline(-3, color='gray', lw=0.8, ls='--', alpha=0.5)
 
+    groups = []
     all_resid = []
-    if pos_excl.any():
-        ymod_excl = model_fn(x_plot[pos_excl], *params_best)
-        resid_excl = (y_plot[pos_excl] - ymod_excl) / ye_plot[pos_excl]
-        all_resid.append(resid_excl)
-        ax_res.errorbar(x_plot[pos_excl], resid_excl, yerr=np.ones_like(resid_excl),
-                        fmt='.', color='gray', markersize=2, elinewidth=0.3,
-                        alpha=0.45, capsize=0, zorder=1.5, label='Excluded')
-    if pos_fit.any():
-        ymod_fit = model_fn(x_plot[pos_fit], *params_best)
-        resid_fit = (y_plot[pos_fit] - ymod_fit) / ye_plot[pos_fit]
-        all_resid.append(resid_fit)
-        ax_res.errorbar(x_plot[pos_fit], resid_fit, yerr=np.ones_like(resid_fit),
-                        fmt='.', color='black', markersize=3, elinewidth=0.4,
-                        alpha=0.8, capsize=0, zorder=2, label='Fitted')
+    for mask, color, markersize, alpha, zorder, label in [
+        (pos_excl, 'gray', 2, 0.45, 1.5, 'Excluded'),
+        (pos_fit, 'black', 3, 0.8, 2, 'Fitted'),
+    ]:
+        if not mask.any():
+            continue
+        ymod = model_fn(x_plot[mask], *params_best)
+        resid = (y_plot[mask] - ymod) / ye_plot[mask]
+        finite = np.isfinite(resid)
+        if not finite.any():
+            continue
+        x_resid = x_plot[mask][finite]
+        resid = resid[finite]
+        all_resid.append(resid)
+        groups.append((x_resid, resid, color, markersize, alpha, zorder, label))
 
     if all_resid:
         resid_abs = np.abs(np.concatenate(all_resid))
@@ -673,6 +685,25 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
         ymax = max(7.0, min(30.0, 1.2 * np.percentile(finite, 99))) if len(finite) else 7.0
     else:
         ymax = 7.0
+
+    for x_resid, resid, color, markersize, alpha, zorder, label in groups:
+        in_range = (resid >= -ymax) & (resid <= ymax)
+        high = resid > ymax
+        low = resid < -ymax
+        if in_range.any():
+            ax_res.errorbar(x_resid[in_range], resid[in_range],
+                            yerr=np.ones_like(resid[in_range]),
+                            fmt='.', color=color, markersize=markersize,
+                            elinewidth=0.3, alpha=alpha, capsize=0,
+                            zorder=zorder, label=label)
+        if high.any():
+            ax_res.scatter(x_resid[high], np.full(high.sum(), 0.96 * ymax),
+                           marker='^', s=22 if markersize > 2 else 18,
+                           color=color, alpha=alpha, zorder=zorder + 0.2)
+        if low.any():
+            ax_res.scatter(x_resid[low], np.full(low.sum(), -0.96 * ymax),
+                           marker='v', s=22 if markersize > 2 else 18,
+                           color=color, alpha=alpha, zorder=zorder + 0.2)
     ax_res.set_xscale('log'); ax_res.set_xlim(1e-4, 13); ax_res.set_ylim(-ymax, ymax)
     ax_res.set_xlabel('Days post-burst', fontsize=11)
     ax_res.set_ylabel('Residuals (σ)', fontsize=10)
@@ -1007,38 +1038,23 @@ if __name__ == '__main__':
     ye_plot = eflux_all[mask_plot]
 
     if args.nomodel:
-        # --- Running RMS of background (col 5), window=10, sliding
-        bkg_col = rawdata[:, 5]
-        N_raw   = len(bkg_col)
-        WIN     = 10
-        flagged = np.zeros(N_raw, dtype=bool)
-        n_bad_windows = 0
-        for i in range(N_raw - WIN + 1):
-            rms_i = np.sqrt(np.mean(bkg_col[i:i+WIN]**2))
-            if rms_i > 1.0:
-                flagged[i:i+WIN] = True
-                n_bad_windows += 1
-        print(f"Running RMS (window={WIN}): {n_bad_windows} windows exceed RMS>1, "
-              f"{flagged.sum()} data points flagged")
-
         # --- Extended mask: first cadence onward through end of data
         mask_ext = (x_all > -HALF_C) & (x_all <= x_all.max())
         xp   = x_all[mask_ext]
         yp   = y_all[mask_ext]
         yep  = yerr_all[mask_ext]
-        fp   = flagged[mask_ext]
 
-        # --- Pre-burst baseline: weighted mean of unflagged t in [-6 h, 0]
-        pre = (x_all >= -1.0) & (x_all <= 0) & ~flagged
+        # --- Pre-burst baseline: weighted mean of all t in [-6 h, 0]
+        pre = (x_all >= -1.0) & (x_all <= 0)
         wt      = 1.0 / yerr_all[pre]**2
         bkg_val = np.sum(wt * y_all[pre]) / np.sum(wt)
         bkg_err = np.sqrt(1.0 / np.sum(wt))
         print(f"Pre-burst baseline: {bkg_val:.4f} +/- {bkg_err:.4f} cps  (N={pre.sum()})")
 
-        # --- Log-bin unflagged data from 0.07 d onwards
+        # --- Log-bin all data from 0.07 d onwards
         BIN_START = 0.07
         nbins     = 20
-        sel       = (xp >= BIN_START) & ~fp
+        sel       = xp >= BIN_START
         x_s, y_s, ye_s = xp[sel], yp[sel], yep[sel]
         x_binned, y_binned, ye_binned = [], [], []
         if len(x_s) > 0:
@@ -1060,30 +1076,19 @@ if __name__ == '__main__':
         # --- Plot
         fig, ax = plt.subplots(figsize=(8, 6.5))
 
-        # Unflagged data
-        good_pos = ~fp & (yp >  0)
-        good_neg = ~fp & (yp <= 0)
-        bad_pos  =  fp & (yp >  0)
-        bad_neg  =  fp & (yp <= 0)
+        pos = yp > 0
+        nonpos = ~pos
 
-        if good_neg.any():
-            ax.errorbar(xp[good_neg], np.abs(yp[good_neg]), yerr=yep[good_neg],
-                        fmt='.', color='lightgray', markersize=2, elinewidth=0.4,
-                        alpha=0.3, capsize=0, zorder=1)
-        ax.errorbar(xp[good_pos], yp[good_pos], yerr=yep[good_pos],
+        if pos.any():
+            ax.errorbar(xp[pos], yp[pos], yerr=yep[pos],
                     fmt='.', color='black', markersize=3, elinewidth=0.4,
-                    alpha=0.8, capsize=0, zorder=2, label='TESS (unflagged)')
-
-        # Flagged data
-        if bad_neg.any():
-            ax.errorbar(xp[bad_neg], np.abs(yp[bad_neg]), yerr=yep[bad_neg],
-                        fmt='.', color='lightsalmon', markersize=2, elinewidth=0.4,
-                        alpha=0.3, capsize=0, zorder=1.5)
-        if bad_pos.any():
-            ax.errorbar(xp[bad_pos], yp[bad_pos], yerr=yep[bad_pos],
-                        fmt='.', color='tomato', markersize=3, elinewidth=0.4,
-                        alpha=0.6, capsize=0, zorder=2.5,
-                        label=f'Flagged (RMS$_{{10}}>1$, N={fp.sum()})')
+                    alpha=0.8, capsize=0, zorder=2, label='TESS')
+        floor_trans = blended_transform_factory(ax.transData, ax.transAxes)
+        if nonpos.any():
+            ax.scatter(xp[nonpos], np.full(nonpos.sum(), 0.025),
+                       marker='v', s=18, color='black', alpha=0.5,
+                       transform=floor_trans, clip_on=False, zorder=3,
+                       label='TESS <= 0')
 
         # ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
         #             color='mediumseagreen', markersize=8, elinewidth=1.4,
@@ -1093,12 +1098,18 @@ if __name__ == '__main__':
         # Log-binned data overlay
         if len(x_binned) > 0:
             bin_pos = y_binned > 0
+            bin_nonpos = ~bin_pos
             if bin_pos.any():
                 ax.errorbar(x_binned[bin_pos], y_binned[bin_pos],
                             yerr=ye_binned[bin_pos],
                             fmt='o', color='crimson', markersize=6,
                             elinewidth=1.2, capsize=3, zorder=6,
                             label=f'Log-binned ($\\geq${BIN_START} d)')
+            if bin_nonpos.any():
+                ax.scatter(x_binned[bin_nonpos], np.full(bin_nonpos.sum(), 0.055),
+                           marker='v', s=38, color='crimson', alpha=0.85,
+                           transform=floor_trans, clip_on=False, zorder=7,
+                           label=f'Log-binned <= 0 ($\\geq${BIN_START} d)')
 
         # Pre-burst baseline overplot
         t_lo   = xp[xp > 0].min()
@@ -1112,7 +1123,7 @@ if __name__ == '__main__':
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.set_xlim(1e-4, t_hi * 1.05)
-        vis = (xp > 1e-4) & (yp > 0) & ~fp
+        vis = (xp > 1e-4) & (yp > 0)
         ax.set_ylim(yep[vis].min() * 0.3, yp[vis].max() * 3)
         ax.grid(True, which='both', alpha=0.2, lw=0.5)
         ax.set_xlabel('Days post-burst', fontsize=11)
