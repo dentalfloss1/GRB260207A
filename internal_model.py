@@ -33,7 +33,7 @@ WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
 SHIFT_FIT_MAX = 0.08         # days after computed shifted origin for DSBPL fit
 SHIFT_PLOT_MAX = 1.0         # days after computed shifted origin for DSBPL plot
-COMBINED_FIT_MAX = 1.0       # days post-burst for combined FS+DSBPL fit
+COMBINED_FIT_MAX = 6.5       # days post-burst for combined FS+DSBPL fit
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
