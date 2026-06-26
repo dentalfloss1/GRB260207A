@@ -6,12 +6,13 @@ internal_model.py. The full light curve is then fit with one refreshed-ejecta
 episode that drives two different shock responses:
 
     F_model(t) = F_FS,0(t) * [E(t) / E0]**((p + 3) / 4)
-                 + F_RS_energy * Psi_RS(t; t_start, t_energy_end, t_cross)
+                 + F_RS_cross * SBPL_RS(t; t_cross)
                  + C_bg
 
 The forward shock responds to cumulative injected energy. The reverse shock is
-produced by ejecta processing and is not multiplied by the same energy factor.
-The background is never multiplied by either source component.
+a single smoothly broken power law in shifted time, peaking at t_cross, and is
+not multiplied by the same energy factor. The background is never multiplied by
+either source component.
 """
 
 import os
@@ -39,9 +40,6 @@ S_AB       = 0.1
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
-SHIFT_FIT_MAX = 0.08         # days after computed shifted origin for DSBPL fit
-SHIFT_PLOT_MAX = 1.0         # days after computed shifted origin for DSBPL plot
-COMBINED_FIT_MAX = 1.0       # days post-burst for combined FS+DSBPL fit
 INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
 
 # ---------------------------------------------------------------
@@ -49,11 +47,6 @@ INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
 # ---------------------------------------------------------------
 def sbpl(t, F0, tb, a1, a2, S):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
-
-def dsbpl(t, F0, tb1, tb2, a1, a2, a3, S):
-    f1 = (0.5*(1 + (t/tb1)**(1/S)))**(-(a2-a1)*S)
-    f2 = (0.5*(1 + (t/tb2)**(1/S)))**(-(a3-a2)*S)
-    return F0 * (t/tb1)**(-a1) * f1 * f2
 
 def windowed_eval(model_fn, t_arr, params):
     """Integrate near-trigger (t < 5 min) points over 200-s cadence window.
@@ -150,172 +143,17 @@ def get_components_FS(t, p):
 theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), 2.25, -4.5])
 
 # ===============================================================
-# Shifted excess model — DSBPL only
-# The forward-shock subtraction already removes the fitted C_bg, so adding a
-# second constant here double-counts the background.
-# theta: [logF0, logTb1, logTb2, a1, a2, a3]
-# ===============================================================
-S_SHIFT = 0.02
-
-def model_shifted_excess(t, F0, tb1, tb2, a1, a2, a3):
-    pos = t > 0
-    ts = np.where(pos, t, 1e-10)
-    comp = np.where(pos, dsbpl(ts, F0, tb1, tb2, a1, a2, a3, S_SHIFT), 0.0)
-    return comp
-
-PRIOR_SHIFT = {
-    'logF0':   (-6.5, -2.5),
-    'logTb1':  (np.log10(0.01), np.log10(0.02)),
-    'logTb2':  (np.log10(0.02), np.log10(0.05)),
-    'a1':      (-8.0,  0.0),
-    'a2':      (-2.0,  5.0),
-    'a3':      ( 0.2, 12.0),
-}
-NAMES_SHIFT = list(PRIOR_SHIFT.keys())
-
-def log_prior_shift(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_SHIFT.values()):
-        if not (lo <= v <= hi): return -np.inf
-    if theta[2] <= theta[1]: return -np.inf
-    return 0.0
-
-def theta_to_params_shift(theta):
-    logF0, logTb1, logTb2, a1, a2, a3 = theta
-    return (10**logF0, 10**logTb1, 10**logTb2, a1, a2, a3)
-
-def log_prob_shift(theta, x, y, yerr):
-    lp = log_prior_shift(theta)
-    if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_shift(theta)
-    ymod = model_shifted_excess(x, *params)
-    if not np.all(np.isfinite(ymod)): return -np.inf
-    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
-
-def get_components_shift(t, p):
-    pos = t > 0
-    ts = np.where(pos, t, 1e-10)
-    comp = np.where(pos, dsbpl(ts, p[0], p[1], p[2], p[3], p[4], p[5], S_SHIFT), 0.0)
-    return [
-        ('DSBPL excess', comp, '--', 'darkorange',
-         f"tb=({p[1]:.3f},{p[2]:.3f}) d  alpha=({p[3]:.2f},{p[4]:.2f},{p[5]:.2f})"),
-    ]
-
-theta0_SHIFT = np.array([np.log10(3e-4), np.log10(0.015), np.log10(0.035),
-                         -3.0, 1.0, 3.0])
-
-# ===============================================================
-# Combined trigger-frame model — FS SBPL + DSBPL(t - t0_D) + C_bg
-# theta: [logF0_FS, logTb_FS, p, logF0_D, t0_D, logTauB1_D,
-#         logTauB2_D, a1_D, a2_D, a3_D, logC_bg]
-# ===============================================================
-COMBINED_T0_HALF_WIDTH = 0.02
-PRIOR_COMBINED = {
-    'logF0_FS':  (-6.0, -2.3),
-    'logTb_FS':  (-2.523, -1.699),
-    'p':         ( 2.1,  2.5),
-    'logF0_D':   (-8.0, -2.0),
-    't0_D':      ( 0.0,  0.08),
-    'logTauB1_D': (np.log10(0.003), np.log10(0.08)),
-    'logTauB2_D': (np.log10(0.006), np.log10(0.20)),
-    'a1_D':      (-8.0,  0.0),
-    'a2_D':      (-2.0,  5.0),
-    'a3_D':      ( 0.2, 12.0),
-    'logC_bg':   (-10.0, -4.0),
-}
-NAMES_COMBINED = list(PRIOR_COMBINED.keys())
-
-def set_combined_t0_prior(t0_center):
-    lo = max(0.0, float(t0_center) - COMBINED_T0_HALF_WIDTH)
-    hi = float(t0_center) + COMBINED_T0_HALF_WIDTH
-    PRIOR_COMBINED['t0_D'] = (lo, hi)
-
-def model_combined(t, F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D,
-                   a1_D, a2_D, a3_D, C_bg):
-    fs = model_FS(t, F0_FS, tb_FS, p_FS, C_bg)
-    tau = t - t0_D
-    pos = tau > 0
-    tau_eval = np.where(pos, tau, 1e-10)
-    ds = np.where(pos, dsbpl(tau_eval, F0_D, tau_b1_D, tau_b2_D,
-                             a1_D, a2_D, a3_D, S_SHIFT), 0.0)
-    return fs + ds
-
-def log_prior_combined(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_COMBINED.values()):
-        if not (lo <= v <= hi): return -np.inf
-    if theta[6] <= theta[5]: return -np.inf
-    return 0.0
-
-def theta_to_params_combined(theta):
-    (logF0_FS, logTb_FS, p_FS, logF0_D, t0_D, logTauB1_D,
-     logTauB2_D, a1_D, a2_D, a3_D, logC_bg) = theta
-    return (10**logF0_FS, 10**logTb_FS, p_FS,
-            10**logF0_D, t0_D, 10**logTauB1_D, 10**logTauB2_D,
-            a1_D, a2_D, a3_D, 10**logC_bg)
-
-def log_prob_combined(theta, x, y, yerr):
-    lp = log_prior_combined(theta)
-    if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_combined(theta)
-    try:    ymod = windowed_eval(model_combined, x, params)
-    except: return -np.inf
-    if not np.all(np.isfinite(ymod)): return -np.inf
-    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
-
-def theta0_combined_from_fits(theta_FS_best, p_shift, t0_D):
-    F0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D = p_shift
-    theta0 = np.array([
-        theta_FS_best[0],
-        theta_FS_best[1],
-        theta_FS_best[2],
-        np.log10(F0_D),
-        t0_D,
-        np.log10(tau_b1_D),
-        np.log10(tau_b2_D),
-        a1_D,
-        a2_D,
-        a3_D,
-        theta_FS_best[3],
-    ])
-    for j, (lo, hi) in enumerate(PRIOR_COMBINED.values()):
-        theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
-    if theta0[6] <= theta0[5]:
-        theta0[6] = min(PRIOR_COMBINED['logTauB2_D'][1] - 1e-4, theta0[5] + 1e-3)
-    return theta0
-
-def get_components_combined(t, p):
-    F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D, C_bg = p
-    pos_fs = t > 0
-    ts = np.where(pos_fs, t, 1e-10)
-    fs = np.where(pos_fs, sbpl(ts, F0_FS, tb_FS, FS_RISE_ALPHA,
-                               decay_alpha_from_p(p_FS), S_AB), 0.0)
-    tau = t - t0_D
-    pos_d = tau > 0
-    tau_eval = np.where(pos_d, tau, 1e-10)
-    ds = np.where(pos_d, dsbpl(tau_eval, F0_D, tau_b1_D, tau_b2_D,
-                             a1_D, a2_D, a3_D, S_SHIFT), 0.0)
-    cbg = np.full_like(t, C_bg)
-    return [
-        ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={tb_FS*1440:.1f} min  rise=+0.50  decay=-{decay_alpha_from_p(p_FS):.2f}"),
-        ('Second peak (combined)', ds, '--', 'darkorange',
-         f"t0={t0_D:.4f} d  tau_b=({tau_b1_D:.3f},{tau_b2_D:.3f}) d  alpha=({a1_D:.2f},{a2_D:.2f},{a3_D:.2f})"),
-        ('TESS bg', cbg, '-.', 'mediumseagreen',
-         f"C_bg={C_bg*1e6:.2f} uJy"),
-    ]
-
-# ===============================================================
 # Refreshed forward-shock model — shared injection episode, separate responses.
 # theta: [logF0_FS, logTb_FS, p, logC_bg, t_start, t_cross,
-#         log_RE, logF_RS_energy, f_energy, alpha_decay_RS]
+#         log_RE, logF_RS_cross, f_energy]
 # log_RE is a natural log; other log* parameters are log10.
 # ===============================================================
-INJECTION_MODEL_VERSION = 4
 RS_WIDTH_LOG = 0.08
+RS_RISE_ALPHA = -0.5
 
 NAMES_INJECTION = [
     'logF0_FS', 'logTb_FS', 'p', 'logC_bg',
-    't_start', 't_cross', 'log_RE', 'logF_RS_energy', 'f_energy',
-    'alpha_decay_RS',
+    't_start', 't_cross', 'log_RE', 'logF_RS_cross', 'f_energy',
 ]
 
 PRIOR_INJECTION = {
@@ -323,12 +161,11 @@ PRIOR_INJECTION = {
     'logTb_FS': (-2.523, -1.699),
     'p': (2.1, 2.5),
     'logC_bg': (-10.0, -4.0),
-    't_start': (0.012, 0.025),
+    't_start': (0.012, 0.030),
     't_cross': (0.038, 0.060),
     'log_RE': (np.log(1.0001), np.log(10.0)),
-    'logF_RS_energy': (-8.0, -2.0),
+    'logF_RS_cross': (-8.0, -2.0),
     'f_energy': (0.1, 0.8),
-    'alpha_decay_RS': (0.5, 4.0),
 }
 
 def energy_flux_index(p):
@@ -352,59 +189,34 @@ def energy_ratio_injection(t, t_start, t_energy_end, log_RE):
     ratio[t >= t_energy_end] = RE
     return ratio
 
-def alpha_rs_expected_from_p(p):
-    """Relativistic thick-shell ISM RS decay for nu_m < nu_TESS < nu_c."""
+def reverse_shock_decay_alpha(p):
     return (73.0 * p + 21.0) / 96.0
 
-def log_smooth_switch(t, t_switch, width_log=RS_WIDTH_LOG):
-    """Smooth transition centered at t_switch in natural log(time)."""
+def reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross, p,
+                       S=RS_WIDTH_LOG):
+    """Plain shifted-time reverse shock SBPL, normalized to peak at t_cross."""
     t = np.asarray(t, dtype=float)
-    safe_t = np.maximum(t, np.finfo(float).tiny)
-    return 0.5 * (1.0 + np.tanh(np.log(safe_t / t_switch) / width_log))
+    if not (0.0 < t_start < t_cross):
+        raise ValueError("Require 0 < t_start < t_cross")
 
-def rs_activation(t, t_start, t_activate):
-    """Smoothly saturating RS activation factor."""
-    t = np.asarray(t, dtype=float)
-    if not (0.0 < t_start < t_activate):
-        raise ValueError("Require 0 < t_start < t_activate")
-    v = np.clip((t - t_start) / (t_activate - t_start), 0.0, 1.0)
-    return v * v * (3.0 - 2.0 * v)
-
-def refreshed_reverse_shock(t, F_RS_energy, t_start, t_energy_end, t_cross,
-                            alpha_decay,
-                            width_log=RS_WIDTH_LOG):
-    """Reverse shock with activation ending before shell crossing."""
-    t = np.asarray(t, dtype=float)
-    flux = np.zeros_like(t)
-    if not (0.0 < t_start < t_energy_end < t_cross):
-        raise ValueError("Require 0 < t_start < t_energy_end < t_cross")
-
-    active = t > t_start
-    ta = t[active]
-    if len(ta) == 0:
-        return flux
-
-    tau = ta - t_start
-    tau_energy = t_energy_end - t_start
     tau_cross = t_cross - t_start
-    activation = rs_activation(ta, t_start, t_energy_end)
+    tau = np.maximum(t - t_start, np.finfo(float).tiny)
 
-    pre_cross = activation * np.sqrt(np.maximum(tau / tau_energy, 0.0))
-    cross_norm = np.sqrt(tau_cross / tau_energy)
-    post_cross = cross_norm * (ta / t_cross)**(-alpha_decay)
-
-    w = log_smooth_switch(ta, t_cross, width_log)
-    flux[active] = F_RS_energy * ((1.0 - w) * pre_cross + w * post_cross)
-    return flux
+    decay_alpha = reverse_shock_decay_alpha(p)
+    peak_ratio = ((-RS_RISE_ALPHA) / decay_alpha)**S
+    tb = tau_cross / peak_ratio
+    norm = sbpl(np.array([tau_cross]), F_RS_cross, tb,
+                RS_RISE_ALPHA, decay_alpha, S)[0]
+    if not np.isfinite(norm) or norm <= 0:
+        raise ValueError("Invalid reverse-shock normalization")
+    return F_RS_cross * sbpl(tau, F_RS_cross, tb, RS_RISE_ALPHA, decay_alpha, S) / norm
 
 def model_injection(t, F0_FS, tb_FS, p_FS, C_bg,
-                    t_start, t_cross, log_RE, F_RS_energy, f_energy,
-                    alpha_decay_RS):
+                    t_start, t_cross, log_RE, F_RS_cross, f_energy):
     t_energy_end = t_start + f_energy * (t_cross - t_start)
     f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
     e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log_RE)
-    rs = refreshed_reverse_shock(
-        t, F_RS_energy, t_start, t_energy_end, t_cross, alpha_decay_RS)
+    rs = reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross, p_FS)
     return f_fs0 * e_ratio**energy_flux_index(p_FS) + rs + C_bg
 
 def log_prior_injection(theta):
@@ -413,8 +225,7 @@ def log_prior_injection(theta):
             return -np.inf
 
     (logF0_FS, logTb_FS, p_FS, logC_bg,
-     t_start, t_cross, log_RE, logF_RS_energy, f_energy,
-     alpha_decay_RS) = theta
+     t_start, t_cross, log_RE, logF_RS_cross, f_energy) = theta
     tb = 10**logTb_FS
     t_energy_end = t_start + f_energy * (t_cross - t_start)
 
@@ -425,11 +236,9 @@ def log_prior_injection(theta):
 
 def theta_to_params_injection(theta):
     (logF0_FS, logTb_FS, p_FS, logC_bg,
-     t_start, t_cross, log_RE, logF_RS_energy, f_energy,
-     alpha_decay_RS) = theta
+     t_start, t_cross, log_RE, logF_RS_cross, f_energy) = theta
     return (10**logF0_FS, 10**logTb_FS, p_FS, 10**logC_bg,
-            t_start, t_cross, log_RE, 10**logF_RS_energy, f_energy,
-            alpha_decay_RS)
+            t_start, t_cross, log_RE, 10**logF_RS_cross, f_energy)
 
 def log_prob_injection(theta, x, y, yerr):
     lp = log_prior_injection(theta)
@@ -455,7 +264,6 @@ def theta0_injection_from_fs(theta_FS_best):
         np.log(2.9),
         np.log10(1e-5),
         0.30,
-        alpha_rs_expected_from_p(theta_FS_best[2]),
     ])
     for j, (lo, hi) in enumerate(PRIOR_INJECTION.values()):
         theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
@@ -465,22 +273,22 @@ def theta0_injection_from_fs(theta_FS_best):
 
 def get_components_injection(t, p):
     (F0_FS, tb_FS, p_FS, C_bg, t_start, t_cross, log_RE,
-     F_RS_energy, f_energy, alpha_decay_RS) = p
+     F_RS_cross, f_energy) = p
     t_energy_end = t_start + f_energy * (t_cross - t_start)
     fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
     e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log_RE)
     fs_refreshed = fs0 * e_ratio**energy_flux_index(p_FS)
-    rs = refreshed_reverse_shock(
-        t, F_RS_energy, t_start, t_energy_end, t_cross, alpha_decay_RS)
+    rs = reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross, p_FS)
     cbg = np.full_like(t, C_bg)
+    decay_alpha = reverse_shock_decay_alpha(p_FS)
     return [
         ('Unrefreshed FS', fs0 + C_bg, '--', 'dimgray',
          f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(p_FS):.2f}"),
         ('Refreshed FS', fs_refreshed + C_bg, '-', 'darkorange',
          f"R_E={np.exp(log_RE):.2f}"),
         ('Reverse shock', rs, ':', 'crimson',
-         f"F(t_E)={F_RS_energy*1e6:.2f} uJy  "
-         f"f_E={f_energy:.2f}  alpha={alpha_decay_RS:.2f}"),
+         f"F(t_cross)={F_RS_cross*1e6:.2f} uJy  "
+         f"rise=+0.50  decay=-{decay_alpha:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={C_bg*1e6:.2f} uJy"),
     ]
@@ -549,16 +357,6 @@ def _fit_FS(xD, yD, yeD, quick=False):
     return run_emcee(xD, yD, yeD, theta0_FS, PRIOR_FS, log_prob_FS,
                      'Forward shock', quick=quick)
 
-def _fit_shift(xD, yD, yeD, quick=False):
-    np.random.seed(46)
-    return run_emcee(xD, yD, yeD, theta0_SHIFT, PRIOR_SHIFT, log_prob_shift,
-                     'Shifted excess DSBPL', quick=quick)
-
-def _fit_combined(xD, yD, yeD, theta0_combined, quick=False):
-    np.random.seed(52)
-    return run_emcee(xD, yD, yeD, theta0_combined, PRIOR_COMBINED,
-                     log_prob_combined, 'Combined FS+DSBPL', quick=quick)
-
 def _fit_injection(xD, yD, yeD, theta0_injection, quick=False):
     np.random.seed(62)
     return run_emcee(xD, yD, yeD, theta0_injection, PRIOR_INJECTION,
@@ -611,31 +409,14 @@ _CORNER_CFG = {
         labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
                 r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
-    'SHIFT': dict(
-        names=NAMES_SHIFT,
-        scale=[1e6, 1, 1, 1, 1, 1],
-        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{d})$',
-                r'$t_{b,2}\ (\mathrm{d})$', r'$\alpha_1$', r'$\alpha_2$',
-                r'$\alpha_3$'],
-    ),
-    'COMBINED': dict(
-        names=NAMES_COMBINED,
-        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
-        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
-                r'$p$', r'$F_{0,\rm D}\ (\mu\mathrm{Jy})$',
-                r'$t_{0,\rm D}\ (\mathrm{d})$',
-                r'$\tau_{b,1,\rm D}\ (\mathrm{d})$', r'$\tau_{b,2,\rm D}\ (\mathrm{d})$',
-                r'$\alpha_{1,\rm D}$', r'$\alpha_{2,\rm D}$',
-                r'$\alpha_{3,\rm D}$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
-    ),
     'INJECTION': dict(
         names=NAMES_INJECTION,
-        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1, 1],
+        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1],
         labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
                 r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
                 r'$t_s\ (\mathrm{d})$', r'$t_\times\ (\mathrm{d})$',
-                r'$R_E$', r'$F_{\rm RS}(t_E)\ (\mu\mathrm{Jy})$',
-                r'$f_E$', r'$\alpha_{\rm decay,RS}$'],
+                r'$R_E$', r'$F_{\rm RS}(t_\times)\ (\mu\mathrm{Jy})$',
+                r'$f_E$'],
     ),
 }
 
@@ -666,7 +447,7 @@ def save_corner(tag, flat_chain):
 # Plotting helpers  (reference x_plot/y_plot/ye_plot as module globals
 #                    set inside __main__ before these are ever called)
 # ---------------------------------------------------------------
-MODEL_COLOR = {'FS': 'royalblue', 'COMBINED': 'navy', 'INJECTION': 'navy'}
+MODEL_COLOR = {'FS': 'royalblue', 'INJECTION': 'navy'}
 
 def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
     pos          = y_plot > 0
@@ -694,10 +475,10 @@ def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
                    marker='v', s=22, color='black', alpha=0.8,
                    transform=floor_trans, clip_on=False, zorder=4,
                    label='Fitted <= 0')
-    # ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
-    #             color='mediumseagreen', markersize=8, elinewidth=1.4,
-    #             capsize=4, markeredgecolor='k', markeredgewidth=0.6,
-    #             label=f'MASTER T+{t_master*1440:.1f} min')
+    ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
+                color='mediumseagreen', markersize=8, elinewidth=1.4,
+                capsize=4, markeredgecolor='k', markeredgewidth=0.6,
+                label=f'MASTER T+{t_master*1440:.1f} min')
 
 def format_main_ax(ax):
     ax.set_xscale('log'); ax.set_yscale('log')
@@ -771,202 +552,6 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
     ax_res.set_ylabel('Residuals (σ)', fontsize=10)
     ax_res.legend(fontsize=7, loc='upper right')
     ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
-
-def compute_effective_t90(x, excess, t_min, t_max):
-    """Return T05 offset, effective T90, and T95 for positive excess fluence."""
-    sel = (x >= t_min) & (x <= t_max) & np.isfinite(excess) & (excess > 0)
-    tx = x[sel]
-    fx = excess[sel]
-    if len(tx) < 2:
-        return t_min, 0.0, t_min
-
-    order = np.argsort(tx)
-    tx = tx[order]
-    fx = fx[order]
-    edges = np.empty(len(tx) + 1)
-    edges[1:-1] = 0.5 * (tx[:-1] + tx[1:])
-    edges[0] = max(t_min, tx[0] - 0.5 * (tx[1] - tx[0]))
-    edges[-1] = min(t_max, tx[-1] + 0.5 * (tx[-1] - tx[-2]))
-    dt = np.maximum(np.diff(edges), 0.0)
-    cumulative = np.cumsum(fx * dt)
-    total = cumulative[-1]
-    if not np.isfinite(total) or total <= 0:
-        return t_min, 0.0, t_min
-
-    t05 = np.interp(0.05 * total, cumulative, tx)
-    t95 = np.interp(0.95 * total, cumulative, tx)
-    return t05, t95 - t05, t95
-
-def save_shifted_excess_plot(model_fn, params_best, tburst_offset, t90_eff):
-    """Plot positive Data - Model excess versus computed shifted time."""
-    t_shift = x_plot - tburst_offset
-    in_win  = (t_shift > 0) & (t_shift <= SHIFT_PLOT_MAX)
-    ymod    = model_fn(x_plot[in_win], *params_best)
-    excess  = y_plot[in_win] - ymod
-    e_excess = ye_plot[in_win]
-    x_excess = t_shift[in_win]
-
-    pos = excess > 0
-    n_omit = int((~pos).sum())
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    if pos.any():
-        ax.errorbar(x_excess[pos], excess[pos], yerr=e_excess[pos],
-                    fmt='.', color='black', markersize=3, elinewidth=0.4,
-                    alpha=0.8, capsize=0, label='Data - model')
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_xlim(max(x_excess[pos].min() * 0.8, 1e-5) if pos.any() else 1e-5, 1.0)
-    if pos.any():
-        ax.set_ylim(max(e_excess[pos].min() * 0.3, excess[pos].min() * 0.5),
-                    excess[pos].max() * 2.0)
-    ax.set_xlabel(f'Days after T$_0$ + {tburst_offset:.5f} d', fontsize=11)
-    ax.set_ylabel('Data - Model (Jy)', fontsize=11)
-    ax.grid(True, which='both', alpha=0.2, lw=0.5)
-    ax.legend(fontsize=8, loc='best')
-    ax.set_title(f'Positive excess after forward-shock subtraction  '
-                 f'(T90={t90_eff:.3f} d; {n_omit} non-positive points omitted)', fontsize=10)
-    plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
-    plt.tight_layout()
-    plt.savefig('GRB260207A_shifted_excess.png', dpi=130, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: GRB260207A_shifted_excess.png  "
-          f"(positive points={int(pos.sum())}, omitted non-positive={n_omit})")
-
-def save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot,
-                            fit_mask_plot, chain, lp, chi2_r,
-                            tburst_offset, t90_eff):
-    p_best = theta_to_params_shift(chain[np.argmax(lp)])
-    t_model = np.logspace(np.log10(max(x_shift_plot[x_shift_plot > 0].min() * 0.8, 1e-5)),
-                          np.log10(SHIFT_PLOT_MAX), 1200)
-
-    fig, (ax, ax_res) = plt.subplots(
-        2, 1, figsize=(8, 9),
-        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
-
-    pos_data = y_shift_plot > 0
-    fit_pos = fit_mask_plot & pos_data
-    excl_pos = ~fit_mask_plot & pos_data
-    fit_nonpos = fit_mask_plot & ~pos_data
-    excl_nonpos = ~fit_mask_plot & ~pos_data
-    if excl_pos.any():
-        ax.errorbar(x_shift_plot[excl_pos], y_shift_plot[excl_pos],
-                    yerr=ye_shift_plot[excl_pos], fmt='.', color='gray',
-                    markersize=2, elinewidth=0.3, alpha=0.45, capsize=0,
-                    label='Excluded')
-    if fit_pos.any():
-        ax.errorbar(x_shift_plot[fit_pos], y_shift_plot[fit_pos],
-                    yerr=ye_shift_plot[fit_pos], fmt='.', color='black',
-                    markersize=3, elinewidth=0.4, alpha=0.8, capsize=0,
-                    label='Fitted')
-    if (fit_nonpos | excl_nonpos).any():
-        nonpos_x = np.concatenate([x_shift_plot[excl_nonpos], x_shift_plot[fit_nonpos]])
-        nonpos_y = np.concatenate([np.abs(y_shift_plot[excl_nonpos]),
-                                   np.abs(y_shift_plot[fit_nonpos])])
-        nonpos_ye = np.concatenate([ye_shift_plot[excl_nonpos],
-                                    ye_shift_plot[fit_nonpos]])
-        if len(nonpos_x):
-            ax.errorbar(nonpos_x, nonpos_y, yerr=nonpos_ye, fmt='.',
-                        color='lightgray', markersize=2, elinewidth=0.3,
-                        alpha=0.35, capsize=0, label='Non-positive residuals (abs)')
-    ax.axvline(SHIFT_FIT_MAX, color='gray', ls='--', lw=0.9, alpha=0.6,
-               label=f'Fit limit: {SHIFT_FIT_MAX:.2f} d')
-
-    rng = np.random.default_rng(46)
-    for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
-        y_samp = model_shifted_excess(t_model, *theta_to_params_shift(chain[i]))
-        ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
-                '-', color='darkorange', lw=0.3, alpha=0.04, zorder=4)
-
-    y_best = model_shifted_excess(t_model, *p_best)
-    ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
-            '-', color='darkorange', lw=2.0, zorder=6,
-            label=f'Best fit  chi2_r={chi2_r:.2f}')
-    for (clabel, cy, ls, ccolor, desc) in get_components_shift(t_model, p_best):
-        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
-                color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
-
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_xlim(t_model.min(), SHIFT_PLOT_MAX)
-    vis = pos_data & np.isfinite(y_shift_plot)
-    if vis.any():
-        ax.set_ylim(max(ye_shift_plot[vis].min() * 0.3, y_shift_plot[vis].min() * 0.5),
-                    y_shift_plot[vis].max() * 2.0)
-    ax.set_ylabel('Data - Forward Shock (Jy)', fontsize=11)
-    ax.set_title(f'Shifted excess: DSBPL only  '
-                 f'(T90={t90_eff:.3f} d)', fontsize=10)
-    ax.legend(fontsize=6.5, loc='best')
-    ax.grid(True, which='both', alpha=0.2, lw=0.5)
-    ax.tick_params(labelbottom=False)
-
-    ymod_data = model_shifted_excess(x_shift_plot, *p_best)
-    resid = (y_shift_plot - ymod_data) / ye_shift_plot
-    ax_res.axhline(0, color='darkorange', lw=1.2, zorder=5)
-    ax_res.axhline( 3, color='gray', lw=0.8, ls='--', alpha=0.5)
-    ax_res.axhline(-3, color='gray', lw=0.8, ls='--', alpha=0.5)
-    ax_res.errorbar(x_shift_plot[~fit_mask_plot], resid[~fit_mask_plot],
-                    yerr=np.ones_like(resid[~fit_mask_plot]),
-                    fmt='.', color='gray', markersize=2, elinewidth=0.3,
-                    alpha=0.45, capsize=0)
-    ax_res.errorbar(x_shift_plot[fit_mask_plot], resid[fit_mask_plot],
-                    yerr=np.ones_like(resid[fit_mask_plot]),
-                    fmt='.', color='black', markersize=3, elinewidth=0.4,
-                    alpha=0.8, capsize=0)
-    ax_res.axvline(SHIFT_FIT_MAX, color='gray', ls='--', lw=0.9, alpha=0.6)
-    finite = np.abs(resid[np.isfinite(resid)])
-    ymax = max(7.0, min(30.0, 1.2 * np.percentile(finite, 99))) if len(finite) else 7.0
-    ax_res.set_xscale('log')
-    ax_res.set_xlim(t_model.min(), SHIFT_PLOT_MAX)
-    ax_res.set_ylim(-ymax, ymax)
-    ax_res.set_xlabel(f'Days after T$_0$ + {tburst_offset:.5f} d', fontsize=11)
-    ax_res.set_ylabel('Residuals (sigma)', fontsize=10)
-    ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
-
-    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
-    plt.savefig('GRB260207A_shifted_excess_dsbpl.png', dpi=130, bbox_inches='tight')
-    plt.close()
-    print("Saved: GRB260207A_shifted_excess_dsbpl.png")
-
-def save_combined_plot(mask_combined_fit, chain, lp, chi2_r, tburst_offset):
-    p_best = theta_to_params_combined(chain[np.argmax(lp)])
-    t_model = np.logspace(np.log10(2e-4), np.log10(13), 1500)
-    color = MODEL_COLOR['COMBINED']
-
-    fig, (ax, ax_res) = plt.subplots(
-        2, 1, figsize=(8, 9),
-        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
-
-    add_data_to_ax(ax, mask_combined_fit)
-
-    rng = np.random.default_rng(52)
-    for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
-        y_samp = model_combined(t_model, *theta_to_params_combined(chain[i]))
-        ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
-                '-', color=color, lw=0.3, alpha=0.04, zorder=4)
-
-    y_best = model_combined(t_model, *p_best)
-    ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
-            '-', color=color, lw=2.0, zorder=6,
-            label=f'Best fit  chi2_r={chi2_r:.2f}')
-    for (clabel, cy, ls, ccolor, desc) in get_components_combined(t_model, p_best):
-        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
-                color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
-
-    ax.axvline(p_best[4], color='dimgray', ls=':', lw=1.1, alpha=0.9,
-               label=f'fitted t0_D={p_best[4]:.4f} d')
-    format_main_ax(ax)
-    ax.tick_params(labelbottom=False)
-    ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Combined original-frame model: FS SBPL + second-peak DSBPL', fontsize=10)
-    ax.legend(fontsize=6.2, loc='best')
-    add_minutes_axis(ax)
-    plot_residuals(ax_res, mask_combined_fit, model_combined, p_best, color)
-
-    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
-    plt.savefig('GRB260207A_emcee_combined.png', dpi=130, bbox_inches='tight')
-    plt.close()
-    print("Saved: GRB260207A_emcee_combined.png")
 
 def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
     p_best = theta_to_params_injection(chain[np.argmax(lp)])
@@ -1154,10 +739,10 @@ if __name__ == '__main__':
                        transform=floor_trans, clip_on=False, zorder=3,
                        label='TESS <= 0')
 
-        # ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
-        #             color='mediumseagreen', markersize=8, elinewidth=1.4,
-        #             capsize=4, markeredgecolor='k', markeredgewidth=0.6,
-        #             label=f'MASTER T+{t_master*1440:.1f} min')
+        ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
+                    color='mediumseagreen', markersize=8, elinewidth=1.4,
+                    capsize=4, markeredgecolor='k', markeredgewidth=0.6,
+                    label=f'MASTER T+{t_master*1440:.1f} min')
 
         # Log-binned data overlay
         if len(x_binned) > 0:
@@ -1287,9 +872,10 @@ if __name__ == '__main__':
     print(f"  {'t_E':>18s}: "
           f"{theta0_injection[4] + theta0_injection[8]*(theta0_injection[5]-theta0_injection[4]):9.5f} d")
     print(f"  {'R_E':>18s}: {np.exp(theta0_injection[6]):9.3f}")
-    print(f"  {'F_RS(t_E)':>18s}: {10**theta0_injection[7]*1e6:9.3f} uJy")
+    print(f"  {'F_RS(t_cross)':>18s}: {10**theta0_injection[7]*1e6:9.3f} uJy")
     print(f"  {'f_E':>18s}: {theta0_injection[8]:9.3f}")
-    print(f"  {'alpha_decay_RS':>18s}: {theta0_injection[9]:9.3f}")
+    print(f"  {'RS rise':>18s}: {0.5:9.3f}   (fixed)")
+    print(f"  {'RS decay':>18s}: {reverse_shock_decay_alpha(theta0_injection[2]):9.3f}   (fixed by p)")
 
     print(f"\nN_injection_fit = {len(xI)},  t in "
           f"[{xI.min()*1440:.2f} min, {xI.max():.3f} d]")
@@ -1307,19 +893,19 @@ if __name__ == '__main__':
                  thetaInjection, NAMES_INJECTION, qInjection,
                  ['F0_FS (uJy)', 'tb_FS (min)', 'p', 'C_bg (uJy)',
                   't_start (d)', 't_cross (d)', 'R_E',
-                  'F_RS(t_E) (uJy)', 'f_E', 'alpha_decay_RS'],
-                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1, 1],
+                  'F_RS(t_cross) (uJy)', 'f_E'],
+                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1],
                  chi2_rInjection)
 
     (F0_FS, tb_FS, p_FS, C_bg, t_start, t_cross, log_RE,
-     F_RS_energy, f_energy, alpha_decay_RS) = pInjection
+     F_RS_cross, f_energy) = pInjection
     t_energy_end = t_start + f_energy * (t_cross - t_start)
     g = energy_flux_index(p_FS)
     RE = np.exp(log_RE)
     e = log_RE / np.log(t_energy_end / t_start)
     alpha_fs = decay_alpha_from_p(p_FS)
     fs_injection_slope = -alpha_fs + g * e
-    f_rs_cross = F_RS_energy * np.sqrt((t_cross - t_start) / (t_energy_end - t_start))
+    rs_decay = reverse_shock_decay_alpha(p_FS)
     print("\nDerived injection diagnostics:")
     print(f"  {'g=(p+3)/4':>24s}: {g:9.3f}")
     print(f"  {'R_E':>24s}: {RE:9.3f}")
@@ -1329,12 +915,11 @@ if __name__ == '__main__':
     print(f"  {'t_E-t_start (min)':>24s}: {(t_energy_end-t_start)*1440:9.3f}")
     print(f"  {'t_cross-t_E (min)':>24s}: {(t_cross-t_energy_end)*1440:9.3f}")
     print(f"  {'t_cross-t_start (min)':>24s}: {(t_cross-t_start)*1440:9.3f}")
-    print(f"  {'F_RS(t_E) (uJy)':>24s}: {F_RS_energy*1e6:9.3f}")
-    print(f"  {'F_RS(t_cross) (uJy)':>24s}: {f_rs_cross*1e6:9.3f}")
+    print(f"  {'F_RS(t_cross) (uJy)':>24s}: {F_RS_cross*1e6:9.3f}")
     print(f"  {'f_E':>24s}: {f_energy:9.3f}")
-    print(f"  {'alpha_decay_RS':>24s}: {alpha_decay_RS:9.3f}")
-    print(f"  {'early RS rise':>24s}: {2.5:9.3f}")
-    print(f"  {'late pre-cross rise':>24s}: {0.5:9.3f}")
+    print(f"  {'RS rise':>24s}: {0.5:9.3f}   (fixed)")
+    print(f"  {'RS decay alpha':>24s}: {rs_decay:9.3f}   (flux ∝ tau^-alpha)")
+    print(f"  {'RS flux slope':>24s}: {-rs_decay:9.3f}")
 
     save_corner('INJECTION', chainInjection)
     save_injection_plot(mask_injection_fit, chainInjection, lpInjection,

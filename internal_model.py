@@ -478,10 +478,10 @@ def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
                    marker='v', s=22, color='black', alpha=0.8,
                    transform=floor_trans, clip_on=False, zorder=4,
                    label='Fitted <= 0')
-    # ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
-    #             color='mediumseagreen', markersize=8, elinewidth=1.4,
-    #             capsize=4, markeredgecolor='k', markeredgewidth=0.6,
-    #             label=f'MASTER T+{t_master*1440:.1f} min')
+    ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
+                color='mediumseagreen', markersize=8, elinewidth=1.4,
+                capsize=4, markeredgecolor='k', markeredgewidth=0.6,
+                label=f'MASTER T+{t_master*1440:.1f} min')
 
 def format_main_ax(ax):
     ax.set_xscale('log'); ax.set_yscale('log')
@@ -888,10 +888,10 @@ if __name__ == '__main__':
                        transform=floor_trans, clip_on=False, zorder=3,
                        label='TESS <= 0')
 
-        # ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
-        #             color='mediumseagreen', markersize=8, elinewidth=1.4,
-        #             capsize=4, markeredgecolor='k', markeredgewidth=0.6,
-        #             label=f'MASTER T+{t_master*1440:.1f} min')
+        ax.errorbar(t_master, F_master, yerr=eF_master, fmt='D',
+                    color='mediumseagreen', markersize=8, elinewidth=1.4,
+                    capsize=4, markeredgecolor='k', markeredgewidth=0.6,
+                    label=f'MASTER T+{t_master*1440:.1f} min')
 
         # Log-binned data overlay
         if len(x_binned) > 0:
