@@ -100,7 +100,7 @@ PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
     'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
     'p':       ( 2.1,  2.5),
-    'logC_bg': (-10.0, -2.0),
+    'logC_bg': (-10.0, -4.0),
 }
 NAMES_FS = list(PRIOR_FS.keys())
 
@@ -209,7 +209,7 @@ PRIOR_COMBINED = {
     'a1_D':      (-8.0,  0.0),
     'a2_D':      (-2.0,  5.0),
     'a3_D':      ( 0.2, 12.0),
-    'logC_bg':   (-10.0, -2.0),
+    'logC_bg':   (-10.0, -4.0),
 }
 NAMES_COMBINED = list(PRIOR_COMBINED.keys())
 

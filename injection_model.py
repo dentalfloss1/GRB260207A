@@ -2,13 +2,21 @@
 GRB260207A — emcee fit of a refreshed forward-shock model.
 
 The early forward shock is the same smoothly broken power law used by
-internal_model.py. The full light curve is then fit with a single forward shock
-whose source flux is multiplied by a monotonic energy-injection history:
+internal_model.py. The full light curve is then fit with one refreshed-ejecta
+episode that drives two different shock responses:
 
-    F_model(t) = F_FS,0(t) * [E(t) / E0]**((p + 3) / 4) + C_bg
+    F_model(t) = F_FS,0(t) * [E(t) / E0]**((p + 3) / 4)
+                 + F_RS_energy * Psi_RS(t; t_start, t_energy_end, t_cross)
+                 + C_bg
 
-The background is never multiplied by the energy factor.
+The forward shock responds to cumulative injected energy. The reverse shock is
+produced by ejecta processing and is not multiplied by the same energy factor.
+The background is never multiplied by either source component.
 """
+
+import os
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -105,7 +113,7 @@ PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
     'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
     'p':       ( 2.1,  2.5),
-    'logC_bg': (-10.0, -2.0),
+    'logC_bg': (-10.0, -4.0),
 }
 NAMES_FS = list(PRIOR_FS.keys())
 
@@ -212,7 +220,7 @@ PRIOR_COMBINED = {
     'a1_D':      (-8.0,  0.0),
     'a2_D':      (-2.0,  5.0),
     'a3_D':      ( 0.2, 12.0),
-    'logC_bg':   (-10.0, -2.0),
+    'logC_bg':   (-10.0, -4.0),
 }
 NAMES_COMBINED = list(PRIOR_COMBINED.keys())
 
@@ -296,34 +304,30 @@ def get_components_combined(t, p):
     ]
 
 # ===============================================================
-# Refreshed forward-shock model — FS source * [E(t)/E0]^g + reverse shock + C_bg
-# theta: [logF0_FS, logTb_FS, p, logC_bg, t_start, t_break, t_end,
-#         log_r1, log_r2, logF_RS_t1, alpha_rise_RS, alpha_mid_RS,
-#         alpha_decay_RS]
-# log_r1/log_r2 are natural logs; other log* parameters are log10.
+# Refreshed forward-shock model — shared injection episode, separate responses.
+# theta: [logF0_FS, logTb_FS, p, logC_bg, t_start, t_cross,
+#         log_RE, logF_RS_energy, f_energy, alpha_decay_RS]
+# log_RE is a natural log; other log* parameters are log10.
 # ===============================================================
+INJECTION_MODEL_VERSION = 4
 RS_WIDTH_LOG = 0.08
-RS_ALPHA_SIGMA = 0.3
 
 NAMES_INJECTION = [
     'logF0_FS', 'logTb_FS', 'p', 'logC_bg',
-    't_start', 't_break', 't_end', 'log_r1', 'log_r2',
-    'logF_RS_t1', 'alpha_rise_RS', 'alpha_mid_RS', 'alpha_decay_RS',
+    't_start', 't_cross', 'log_RE', 'logF_RS_energy', 'f_energy',
+    'alpha_decay_RS',
 ]
 
 PRIOR_INJECTION = {
     'logF0_FS': (-6.0, -2.3),
     'logTb_FS': (-2.523, -1.699),
     'p': (2.1, 2.5),
-    'logC_bg': (-10.0, -2.0),
+    'logC_bg': (-10.0, -4.0),
     't_start': (0.012, 0.025),
-    't_break': (0.025, 0.040),
-    't_end': (0.038, 0.060),
-    'log_r1': (np.log(1.0001), np.log(5.0)),
-    'log_r2': (np.log(1.0), np.log(2.0)),
-    'logF_RS_t1': (-8.0, -2.0),
-    'alpha_rise_RS': (0.5, 8.0),
-    'alpha_mid_RS': (-3.0, 3.0),
+    't_cross': (0.038, 0.060),
+    'log_RE': (np.log(1.0001), np.log(10.0)),
+    'logF_RS_energy': (-8.0, -2.0),
+    'f_energy': (0.1, 0.8),
     'alpha_decay_RS': (0.5, 4.0),
 }
 
@@ -331,73 +335,76 @@ def energy_flux_index(p):
     """ISM, slow cooling, nu_m < nu_TESS < nu_c."""
     return (p + 3.0) / 4.0
 
-def energy_ratio_piecewise(t, t_start, t_break, t_end, log_r1, log_r2):
-    """Return E(t) / E0 for a two-stage monotonic injection history."""
+def energy_ratio_injection(t, t_start, t_energy_end, log_RE):
+    """Single-stage log-linear cumulative blast-wave energy history."""
     t = np.asarray(t, dtype=float)
-    if not (0.0 < t_start < t_break < t_end):
-        raise ValueError("Require 0 < t_start < t_break < t_end")
+    if not (0.0 < t_start < t_energy_end):
+        raise ValueError("Require 0 < t_start < t_energy_end")
 
-    r1 = np.exp(log_r1)
-    r2 = np.exp(log_r2)
+    RE = np.exp(log_RE)
     ratio = np.ones_like(t)
 
-    mask1 = (t >= t_start) & (t < t_break)
-    if np.any(mask1):
-        u1 = np.log(t[mask1] / t_start) / np.log(t_break / t_start)
-        ratio[mask1] = np.exp(log_r1 * u1)
+    during = (t >= t_start) & (t < t_energy_end)
+    if np.any(during):
+        progress = np.log(t[during] / t_start) / np.log(t_energy_end / t_start)
+        ratio[during] = np.exp(log_RE * progress)
 
-    mask2 = (t >= t_break) & (t < t_end)
-    if np.any(mask2):
-        u2 = np.log(t[mask2] / t_break) / np.log(t_end / t_break)
-        ratio[mask2] = r1 * np.exp(log_r2 * u2)
-
-    ratio[t >= t_end] = r1 * r2
+    ratio[t >= t_energy_end] = RE
     return ratio
 
 def alpha_rs_expected_from_p(p):
     """Relativistic thick-shell ISM RS decay for nu_m < nu_TESS < nu_c."""
     return (73.0 * p + 21.0) / 96.0
 
-def log_smooth_switch(t, t_break, width_log=RS_WIDTH_LOG):
-    """Smooth transition centered at t_break in natural log(time)."""
+def log_smooth_switch(t, t_switch, width_log=RS_WIDTH_LOG):
+    """Smooth transition centered at t_switch in natural log(time)."""
     t = np.asarray(t, dtype=float)
     safe_t = np.maximum(t, np.finfo(float).tiny)
-    return 0.5 * (1.0 + np.tanh(np.log(safe_t / t_break) / width_log))
+    return 0.5 * (1.0 + np.tanh(np.log(safe_t / t_switch) / width_log))
 
-def refreshed_reverse_shock(t, F_RS_t1, t_start, t1, t2,
-                            alpha_rise, alpha_mid, alpha_decay,
+def rs_activation(t, t_start, t_activate):
+    """Smoothly saturating RS activation factor."""
+    t = np.asarray(t, dtype=float)
+    if not (0.0 < t_start < t_activate):
+        raise ValueError("Require 0 < t_start < t_activate")
+    v = np.clip((t - t_start) / (t_activate - t_start), 0.0, 1.0)
+    return v * v * (3.0 - 2.0 * v)
+
+def refreshed_reverse_shock(t, F_RS_energy, t_start, t_energy_end, t_cross,
+                            alpha_decay,
                             width_log=RS_WIDTH_LOG):
-    """Semi-physical RS tied to the injection start, break, and end times."""
+    """Reverse shock with activation ending before shell crossing."""
     t = np.asarray(t, dtype=float)
     flux = np.zeros_like(t)
-    if not (0.0 < t_start < t1 < t2):
-        raise ValueError("Require 0 < t_start < t1 < t2")
+    if not (0.0 < t_start < t_energy_end < t_cross):
+        raise ValueError("Require 0 < t_start < t_energy_end < t_cross")
 
     active = t > t_start
     ta = t[active]
     if len(ta) == 0:
         return flux
 
-    u = (ta - t_start) / (t1 - t_start)
-    f_rise = F_RS_t1 * np.maximum(u, 0.0)**alpha_rise
-    f_mid = F_RS_t1 * (ta / t1)**alpha_mid
-    f_t2 = F_RS_t1 * (t2 / t1)**alpha_mid
-    f_decay = f_t2 * (ta / t2)**(-alpha_decay)
+    tau = ta - t_start
+    tau_energy = t_energy_end - t_start
+    tau_cross = t_cross - t_start
+    activation = rs_activation(ta, t_start, t_energy_end)
 
-    w1 = log_smooth_switch(ta, t1, width_log)
-    f_rise_mid = (1.0 - w1) * f_rise + w1 * f_mid
-    w2 = log_smooth_switch(ta, t2, width_log)
-    flux[active] = (1.0 - w2) * f_rise_mid + w2 * f_decay
+    pre_cross = activation * np.sqrt(np.maximum(tau / tau_energy, 0.0))
+    cross_norm = np.sqrt(tau_cross / tau_energy)
+    post_cross = cross_norm * (ta / t_cross)**(-alpha_decay)
+
+    w = log_smooth_switch(ta, t_cross, width_log)
+    flux[active] = F_RS_energy * ((1.0 - w) * pre_cross + w * post_cross)
     return flux
 
 def model_injection(t, F0_FS, tb_FS, p_FS, C_bg,
-                    t_start, t_break, t_end, log_r1, log_r2,
-                    F_RS_t1, alpha_rise_RS, alpha_mid_RS, alpha_decay_RS):
+                    t_start, t_cross, log_RE, F_RS_energy, f_energy,
+                    alpha_decay_RS):
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
     f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
-    e_ratio = energy_ratio_piecewise(t, t_start, t_break, t_end, log_r1, log_r2)
+    e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log_RE)
     rs = refreshed_reverse_shock(
-        t, F_RS_t1, t_start, t_break, t_end,
-        alpha_rise_RS, alpha_mid_RS, alpha_decay_RS)
+        t, F_RS_energy, t_start, t_energy_end, t_cross, alpha_decay_RS)
     return f_fs0 * e_ratio**energy_flux_index(p_FS) + rs + C_bg
 
 def log_prior_injection(theta):
@@ -406,29 +413,23 @@ def log_prior_injection(theta):
             return -np.inf
 
     (logF0_FS, logTb_FS, p_FS, logC_bg,
-     t_start, t_break, t_end, log_r1, log_r2,
-     logF_RS_t1, alpha_rise_RS, alpha_mid_RS, alpha_decay_RS) = theta
+     t_start, t_cross, log_RE, logF_RS_energy, f_energy,
+     alpha_decay_RS) = theta
     tb = 10**logTb_FS
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
 
-    if not (tb < t_start < t_break < t_end < 0.10):
+    if not (tb < t_start < t_energy_end < t_cross < 0.10):
         return -np.inf
 
-    e1 = log_r1 / np.log(t_break / t_start)
-    e2 = log_r2 / np.log(t_end / t_break)
-    if not (0.0 <= e2 < e1 < 3.0):
-        return -np.inf
-
-    alpha_decay_expected = alpha_rs_expected_from_p(p_FS)
-    lp_rs_decay = -0.5 * ((alpha_decay_RS - alpha_decay_expected) / RS_ALPHA_SIGMA)**2
-    return lp_rs_decay
+    return 0.0
 
 def theta_to_params_injection(theta):
     (logF0_FS, logTb_FS, p_FS, logC_bg,
-     t_start, t_break, t_end, log_r1, log_r2,
-     logF_RS_t1, alpha_rise_RS, alpha_mid_RS, alpha_decay_RS) = theta
+     t_start, t_cross, log_RE, logF_RS_energy, f_energy,
+     alpha_decay_RS) = theta
     return (10**logF0_FS, 10**logTb_FS, p_FS, 10**logC_bg,
-            t_start, t_break, t_end, log_r1, log_r2,
-            10**logF_RS_t1, alpha_rise_RS, alpha_mid_RS, alpha_decay_RS)
+            t_start, t_cross, log_RE, 10**logF_RS_energy, f_energy,
+            alpha_decay_RS)
 
 def log_prob_injection(theta, x, y, yerr):
     lp = log_prior_injection(theta)
@@ -450,42 +451,36 @@ def theta0_injection_from_fs(theta_FS_best):
         theta_FS_best[2],
         theta_FS_best[3],
         0.018,
-        0.032,
         0.046,
-        np.log(2.2),
-        np.log(1.3),
+        np.log(2.9),
         np.log10(1e-5),
-        2.0,
-        0.0,
+        0.30,
         alpha_rs_expected_from_p(theta_FS_best[2]),
     ])
     for j, (lo, hi) in enumerate(PRIOR_INJECTION.values()):
         theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
     if theta0[5] <= theta0[4]:
-        theta0[5] = min(PRIOR_INJECTION['t_break'][1] - 1e-4, theta0[4] + 0.004)
-    if theta0[6] <= theta0[5]:
-        theta0[6] = min(PRIOR_INJECTION['t_end'][1] - 1e-4, theta0[5] + 0.006)
+        theta0[5] = min(PRIOR_INJECTION['t_cross'][1] - 1e-4, theta0[4] + 0.020)
     return theta0
 
 def get_components_injection(t, p):
-    (F0_FS, tb_FS, p_FS, C_bg, t_start, t_break, t_end,
-     log_r1, log_r2, F_RS_t1, alpha_rise_RS, alpha_mid_RS,
-     alpha_decay_RS) = p
+    (F0_FS, tb_FS, p_FS, C_bg, t_start, t_cross, log_RE,
+     F_RS_energy, f_energy, alpha_decay_RS) = p
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
     fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
-    e_ratio = energy_ratio_piecewise(t, t_start, t_break, t_end, log_r1, log_r2)
+    e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log_RE)
     fs_refreshed = fs0 * e_ratio**energy_flux_index(p_FS)
     rs = refreshed_reverse_shock(
-        t, F_RS_t1, t_start, t_break, t_end,
-        alpha_rise_RS, alpha_mid_RS, alpha_decay_RS)
+        t, F_RS_energy, t_start, t_energy_end, t_cross, alpha_decay_RS)
     cbg = np.full_like(t, C_bg)
     return [
         ('Unrefreshed FS', fs0 + C_bg, '--', 'dimgray',
          f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(p_FS):.2f}"),
         ('Refreshed FS', fs_refreshed + C_bg, '-', 'darkorange',
-         f"R1={np.exp(log_r1):.2f}  R2={np.exp(log_r2):.2f}"),
+         f"R_E={np.exp(log_RE):.2f}"),
         ('Reverse shock', rs, ':', 'crimson',
-         f"F(t1)={F_RS_t1*1e6:.2f} uJy  ar={alpha_rise_RS:.2f}  "
-         f"amid={alpha_mid_RS:.2f}  alpha={alpha_decay_RS:.2f}"),
+         f"F(t_E)={F_RS_energy*1e6:.2f} uJy  "
+         f"f_E={f_energy:.2f}  alpha={alpha_decay_RS:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={C_bg*1e6:.2f} uJy"),
     ]
@@ -572,7 +567,7 @@ def _fit_injection(xD, yD, yeD, theta0_injection, quick=False):
 # ---------------------------------------------------------------
 # Summarize flat chains
 # ---------------------------------------------------------------
-NATURAL_LOG_PARAMS = {'log_r1', 'log_r2'}
+NATURAL_LOG_PARAMS = {'log_RE'}
 
 def theta_column_to_phys(name, values):
     if name in NATURAL_LOG_PARAMS:
@@ -635,14 +630,12 @@ _CORNER_CFG = {
     ),
     'INJECTION': dict(
         names=NAMES_INJECTION,
-        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1e6, 1, 1, 1],
+        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1, 1],
         labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
                 r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
-                r'$t_s\ (\mathrm{d})$', r'$t_1\ (\mathrm{d})$',
-                r'$t_2\ (\mathrm{d})$', r'$R_1$', r'$R_2$',
-                r'$F_{\rm RS}(t_1)\ (\mu\mathrm{Jy})$',
-                r'$\alpha_{\rm r,RS}$', r'$\alpha_{\rm mid,RS}$',
-                r'$\alpha_{\rm decay,RS}$'],
+                r'$t_s\ (\mathrm{d})$', r'$t_\times\ (\mathrm{d})$',
+                r'$R_E$', r'$F_{\rm RS}(t_E)\ (\mu\mathrm{Jy})$',
+                r'$f_E$', r'$\alpha_{\rm decay,RS}$'],
     ),
 }
 
@@ -1000,8 +993,10 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
         ax.plot(t_model, np.where(cy > 0, cy, np.nan),
                 color=ccolor, ls=ls, lw=1.6, zorder=6, label=f'{clabel}: {desc}')
 
-    t_start, t_break, t_end = p_best[4], p_best[5], p_best[6]
-    for tx, lbl in [(t_start, r'$t_s$'), (t_break, r'$t_1$'), (t_end, r'$t_2$')]:
+    t_start, t_cross, f_energy = p_best[4], p_best[5], p_best[8]
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
+    for tx, lbl in [(t_start, r'$t_s$'), (t_energy_end, r'$t_E$'),
+                    (t_cross, r'$t_\times$')]:
         ax.axvline(tx, color='dimgray', ls=':', lw=0.9, alpha=0.75,
                    label=f'{lbl}={tx:.4f} d')
 
@@ -1288,14 +1283,13 @@ if __name__ == '__main__':
 
     print("\nEnergy-injection initial guess:")
     print(f"  {'t_start':>18s}: {theta0_injection[4]:9.5f} d")
-    print(f"  {'t_break':>18s}: {theta0_injection[5]:9.5f} d")
-    print(f"  {'t_end':>18s}: {theta0_injection[6]:9.5f} d")
-    print(f"  {'R1':>18s}: {np.exp(theta0_injection[7]):9.3f}")
-    print(f"  {'R2':>18s}: {np.exp(theta0_injection[8]):9.3f}")
-    print(f"  {'F_RS(t1)':>18s}: {10**theta0_injection[9]*1e6:9.3f} uJy")
-    print(f"  {'alpha_rise_RS':>18s}: {theta0_injection[10]:9.3f}")
-    print(f"  {'alpha_mid_RS':>18s}: {theta0_injection[11]:9.3f}")
-    print(f"  {'alpha_decay_RS':>18s}: {theta0_injection[12]:9.3f}")
+    print(f"  {'t_cross':>18s}: {theta0_injection[5]:9.5f} d")
+    print(f"  {'t_E':>18s}: "
+          f"{theta0_injection[4] + theta0_injection[8]*(theta0_injection[5]-theta0_injection[4]):9.5f} d")
+    print(f"  {'R_E':>18s}: {np.exp(theta0_injection[6]):9.3f}")
+    print(f"  {'F_RS(t_E)':>18s}: {10**theta0_injection[7]*1e6:9.3f} uJy")
+    print(f"  {'f_E':>18s}: {theta0_injection[8]:9.3f}")
+    print(f"  {'alpha_decay_RS':>18s}: {theta0_injection[9]:9.3f}")
 
     print(f"\nN_injection_fit = {len(xI)},  t in "
           f"[{xI.min()*1440:.2f} min, {xI.max():.3f} d]")
@@ -1312,35 +1306,35 @@ if __name__ == '__main__':
     print_params('FORWARD SHOCK ENERGY-INJECTION MODEL',
                  thetaInjection, NAMES_INJECTION, qInjection,
                  ['F0_FS (uJy)', 'tb_FS (min)', 'p', 'C_bg (uJy)',
-                  't_start (d)', 't_break (d)', 't_end (d)',
-                  'R1', 'R2', 'F_RS(t1) (uJy)', 'alpha_rise_RS',
-                  'alpha_mid_RS', 'alpha_decay_RS'],
-                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1e6, 1, 1, 1],
+                  't_start (d)', 't_cross (d)', 'R_E',
+                  'F_RS(t_E) (uJy)', 'f_E', 'alpha_decay_RS'],
+                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1, 1],
                  chi2_rInjection)
 
-    (F0_FS, tb_FS, p_FS, C_bg, t_start, t_break, t_end,
-     log_r1, log_r2, F_RS_t1, alpha_rise_RS, alpha_mid_RS,
-     alpha_decay_RS) = pInjection
+    (F0_FS, tb_FS, p_FS, C_bg, t_start, t_cross, log_RE,
+     F_RS_energy, f_energy, alpha_decay_RS) = pInjection
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
     g = energy_flux_index(p_FS)
-    R1 = np.exp(log_r1)
-    R2 = np.exp(log_r2)
-    e1 = log_r1 / np.log(t_break / t_start)
-    e2 = log_r2 / np.log(t_end / t_break)
-    s1 = 8.0 * e1 / (3.0 - e1) if e1 < 3.0 else np.inf
-    s2 = 8.0 * e2 / (3.0 - e2) if e2 < 3.0 else np.inf
+    RE = np.exp(log_RE)
+    e = log_RE / np.log(t_energy_end / t_start)
+    alpha_fs = decay_alpha_from_p(p_FS)
+    fs_injection_slope = -alpha_fs + g * e
+    f_rs_cross = F_RS_energy * np.sqrt((t_cross - t_start) / (t_energy_end - t_start))
     print("\nDerived injection diagnostics:")
     print(f"  {'g=(p+3)/4':>24s}: {g:9.3f}")
-    print(f"  {'R_final':>24s}: {R1*R2:9.3f}")
-    print(f"  {'final flux boost':>24s}: {(R1*R2)**g:9.3f}")
-    print(f"  {'F_RS(t1) (uJy)':>24s}: {F_RS_t1*1e6:9.3f}")
-    print(f"  {'alpha_rise_RS':>24s}: {alpha_rise_RS:9.3f}")
-    print(f"  {'alpha_mid_RS':>24s}: {alpha_mid_RS:9.3f}")
+    print(f"  {'R_E':>24s}: {RE:9.3f}")
+    print(f"  {'energy index e':>24s}: {e:9.3f}")
+    print(f"  {'FS slope during injection':>24s}: {fs_injection_slope:9.3f}")
+    print(f"  {'final FS flux boost':>24s}: {RE**g:9.3f}")
+    print(f"  {'t_E-t_start (min)':>24s}: {(t_energy_end-t_start)*1440:9.3f}")
+    print(f"  {'t_cross-t_E (min)':>24s}: {(t_cross-t_energy_end)*1440:9.3f}")
+    print(f"  {'t_cross-t_start (min)':>24s}: {(t_cross-t_start)*1440:9.3f}")
+    print(f"  {'F_RS(t_E) (uJy)':>24s}: {F_RS_energy*1e6:9.3f}")
+    print(f"  {'F_RS(t_cross) (uJy)':>24s}: {f_rs_cross*1e6:9.3f}")
+    print(f"  {'f_E':>24s}: {f_energy:9.3f}")
     print(f"  {'alpha_decay_RS':>24s}: {alpha_decay_RS:9.3f}")
-    print(f"  {'alpha_RS expected':>24s}: {alpha_rs_expected_from_p(p_FS):9.3f}")
-    print(f"  {'e1':>24s}: {e1:9.3f}")
-    print(f"  {'e2':>24s}: {e2:9.3f}")
-    print(f"  {'s1':>24s}: {s1:9.3f}")
-    print(f"  {'s2':>24s}: {s2:9.3f}")
+    print(f"  {'early RS rise':>24s}: {2.5:9.3f}")
+    print(f"  {'late pre-cross rise':>24s}: {0.5:9.3f}")
 
     save_corner('INJECTION', chainInjection)
     save_injection_plot(mask_injection_fit, chainInjection, lpInjection,

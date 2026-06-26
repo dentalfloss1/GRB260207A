@@ -104,7 +104,13 @@ def fit_injection_combined(quick=True):
 def load_or_fit(refit=False, quick=True):
     if CACHE_PATH.exists() and not refit:
         cache = np.load(CACHE_PATH)
-        return cache["theta_internal"], cache["theta_injection"], "cache"
+        theta_internal = cache["theta_internal"]
+        theta_injection = cache["theta_injection"]
+        cache_version = int(cache["injection_model_version"]) if "injection_model_version" in cache else None
+        if (len(theta_injection) == len(injection.NAMES_INJECTION) and
+                cache_version == injection.INJECTION_MODEL_VERSION):
+            return theta_internal, theta_injection, "cache"
+        print("Cached injection fit is stale; refitting.")
 
     theta_internal = fit_internal_combined(quick=quick)
 
@@ -117,6 +123,7 @@ def load_or_fit(refit=False, quick=True):
         CACHE_PATH,
         theta_internal=theta_internal,
         theta_injection=theta_injection,
+        injection_model_version=injection.INJECTION_MODEL_VERSION,
     )
     return theta_internal, theta_injection, "refit"
 
