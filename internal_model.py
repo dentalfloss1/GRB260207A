@@ -27,6 +27,7 @@ eF_master   = F_master * 0.30
 
 CADENCE    = 200 / 86400
 HALF_C     = CADENCE / 2
+S_AB       = 0.02
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
@@ -80,31 +81,24 @@ def windowed_eval(model_fn, t_arr, params):
     return out
 
 # ===============================================================
-# Forward-shock model — Granot & Sari nu_m crossing + TESS-bg constant
+# Forward-shock model — SBPL + TESS-bg constant, S=0.02
 # theta: [logF0, logTb, p, logC_bg]
 # ===============================================================
+FS_RISE_ALPHA = -0.5
+
 def decay_alpha_from_p(p):
     return 3.0 * (p - 1.0) / 4.0
 
-def granot_sari_s(p):
-    return 1.84 - 0.40 * p
-
-def forward_shock_source_flux(t, F_b, tb, p):
-    """Source-only FS flux for nu_m crossing the band; F_b is flux at t=tb."""
+def forward_shock_source_flux(t, F0, tb, p):
+    """Source-only forward-shock flux; zero before the trigger."""
     t = np.asarray(t, dtype=float)
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
-    if not (F_b > 0.0 and tb > 0.0 and p > 2.0):
-        return np.full_like(t, np.nan)
-    x = ts / tb
-    s = granot_sari_s(p)
-    term_rise = x**(-0.5 * s)
-    term_decay = x**(0.75 * s * (p - 1.0))
-    fs = F_b * ((term_rise + term_decay) / 2.0)**(-1.0 / s)
-    return np.where(pos, fs, 0.0)
+    a2 = decay_alpha_from_p(p)
+    return np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, S_AB), 0.0)
 
-def model_FS(t, F_b, tb, p, C_bg):
-    return forward_shock_source_flux(t, F_b, tb, p) + C_bg
+def model_FS(t, F0, tb, p, C_bg):
+    return forward_shock_source_flux(t, F0, tb, p) + C_bg
 
 PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
@@ -139,8 +133,7 @@ def get_components_FS(t, p):
     cbg = np.full_like(t, p[3])
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  "
-         f"p={p[2]:.2f}  s={granot_sari_s(p[2]):.2f}"),
+         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  p={p[2]:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={p[3]*1e6:.2f} µJy"),
     ]
@@ -292,7 +285,7 @@ def get_components_combined(t, p):
     return [
         ('Forward shock', fs, '--', 'goldenrod',
          f"tb={tb_FS*1440:.1f} min  rise=+0.50  "
-         f"decay=-{decay_alpha_from_p(p_FS):.2f}  s={granot_sari_s(p_FS):.2f}"),
+         f"decay=-{decay_alpha_from_p(p_FS):.2f}"),
         ('Second peak (combined)', ds, '--', 'darkorange',
          f"t0={t0_D:.4f} d  tau_b=({tau_b1_D:.3f},{tau_b2_D:.3f}) d  alpha=({a1_D:.2f},{a2_D:.2f},{a3_D:.2f})"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
@@ -408,7 +401,7 @@ _CORNER_CFG = {
     'FS': dict(
         names=NAMES_FS,
         scale=[1e6, 1440, 1, 1e6],
-        labels=[r'$F_b\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
+        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
                 r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
     'SHIFT': dict(
@@ -421,7 +414,7 @@ _CORNER_CFG = {
     'COMBINED': dict(
         names=NAMES_COMBINED,
         scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
-        labels=[r'$F_{b,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
                 r'$p$', r'$F_{0,\rm D}\ (\mu\mathrm{Jy})$',
                 r'$t_{0,\rm D}\ (\mathrm{d})$',
                 r'$\tau_{b,1,\rm D}\ (\mathrm{d})$', r'$\tau_{b,2,\rm D}\ (\mathrm{d})$',
@@ -969,7 +962,7 @@ if __name__ == '__main__':
     decay_best = decay_alpha_from_p(pFS[2])
 
     print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
-                 ['F_b (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
+                 ['F0 (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
                  [1e6, 1440, 1, 1e6],
                  chi2_rFS)
     print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
@@ -1008,7 +1001,7 @@ if __name__ == '__main__':
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock only: Granot-Sari nu_m crossing', fontsize=10)
+    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
     ax.legend(fontsize=6.5, loc='lower left')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
@@ -1097,7 +1090,7 @@ if __name__ == '__main__':
     chi2_combined = -2*np.max(lpCombined)
     chi2_rCombined = chi2_combined / (len(xC) - len(NAMES_COMBINED))
     print_params('COMBINED FS + DSBPL MODEL', thetaCombined, NAMES_COMBINED, qCombined,
-                 ['F_b,FS (uJy)', 'tb_FS (min)', 'p',
+                 ['F0_FS (uJy)', 'tb_FS (min)', 'p',
                   'F0_D (uJy)', 't0_D (d)', 'tau_b1_D (d)', 'tau_b2_D (d)',
                   'a1_D', 'a2_D', 'a3_D', 'C_bg (uJy)'],
                  [1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],

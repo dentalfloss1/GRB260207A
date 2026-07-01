@@ -92,6 +92,7 @@ def fit_injection_combined(quick=True):
     chain_fs, lp_fs = injection._fit_FS(
         x_plot[mask_fs], y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
     theta_fs = best_theta(chain_fs, lp_fs)
+    injection.S_AB = injection.theta_to_params_FS(theta_fs)[3]
 
     theta0_injection = injection.theta0_injection_from_fs(theta_fs)
     mask_injection = (x_plot >= -1.0) & (x_plot <= injection.COMBINED_FIT_MAX)

@@ -36,11 +36,12 @@ eF_master   = F_master * 0.30
 
 CADENCE    = 200 / 86400
 HALF_C     = CADENCE / 2
+S_AB       = 0.02
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
 INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
-INJECTION_MODEL_VERSION = 6  # Bump when injection sampler coordinates change.
+INJECTION_MODEL_VERSION = 8  # Bump when injection sampler coordinates change.
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
@@ -83,38 +84,32 @@ def windowed_eval(model_fn, t_arr, params):
     return out
 
 # ===============================================================
-# Forward-shock model — Granot & Sari nu_m crossing + TESS-bg constant
-# theta: [logF0, logTb, logC_bg]
+# Forward-shock model — SBPL + TESS-bg constant
+# theta: [logF0, logTb, logC_bg, logS_FS]
 # ===============================================================
+FS_RISE_ALPHA = -0.5
 P_FIXED = 2.3
 
 def decay_alpha_from_p(p):
     return 3.0 * (p - 1.0) / 4.0
 
-def granot_sari_s(p):
-    return 1.84 - 0.40 * p
-
-def forward_shock_source_flux(t, F_b, tb, p):
-    """Source-only FS flux for nu_m crossing the band; F_b is flux at t=tb."""
+def forward_shock_source_flux(t, F0, tb, p, S=None):
+    """Source-only forward-shock flux; zero before the trigger."""
     t = np.asarray(t, dtype=float)
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
-    if not (F_b > 0.0 and tb > 0.0 and p > 2.0):
-        return np.full_like(t, np.nan)
-    x = ts / tb
-    s = granot_sari_s(p)
-    term_rise = x**(-0.5 * s)
-    term_decay = x**(0.75 * s * (p - 1.0))
-    fs = F_b * ((term_rise + term_decay) / 2.0)**(-1.0 / s)
-    return np.where(pos, fs, 0.0)
+    a2 = decay_alpha_from_p(p)
+    smooth = S_AB if S is None else S
+    return np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, smooth), 0.0)
 
-def model_FS(t, F0, tb, C_bg):
-    return forward_shock_source_flux(t, F0, tb, P_FIXED) + C_bg
+def model_FS(t, F0, tb, C_bg, S_FS):
+    return forward_shock_source_flux(t, F0, tb, P_FIXED, S_FS) + C_bg
 
 PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
     'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
     'logC_bg': (-10.0, -4.0),
+    'logS_FS': (np.log10(0.01), np.log10(1.5)),
 }
 NAMES_FS = list(PRIOR_FS.keys())
 
@@ -124,8 +119,8 @@ def log_prior_FS(theta):
     return 0.0
 
 def theta_to_params_FS(theta):
-    logF0, logTb, logC_bg = theta
-    return (10**logF0, 10**logTb, 10**logC_bg)
+    logF0, logTb, logC_bg, logS_FS = theta
+    return (10**logF0, 10**logTb, 10**logC_bg, 10**logS_FS)
 
 def log_prob_FS(theta, x, y, yerr):
     lp = log_prior_FS(theta)
@@ -137,19 +132,19 @@ def log_prob_FS(theta, x, y, yerr):
     return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
 def get_components_FS(t, p):
-    # p: F0, tb, C_bg
+    # p: F0, tb, C_bg, S_FS
     a2  = decay_alpha_from_p(P_FIXED)
-    fs  = forward_shock_source_flux(t, p[0], p[1], P_FIXED)
+    fs  = forward_shock_source_flux(t, p[0], p[1], P_FIXED, p[3])
     cbg = np.full_like(t, p[2])
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  "
-         f"p={P_FIXED:.2f}  s={granot_sari_s(P_FIXED):.2f}"),
+         f"tb={p[1]*1440:.1f} min  S={p[3]:.3f}  "
+         f"rise=+0.50  decay=-{a2:.2f}  p={P_FIXED:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={p[2]*1e6:.2f} µJy"),
     ]
 
-theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), -4.5])
+theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), -4.5, np.log10(S_AB)])
 
 # ===============================================================
 # Refreshed forward-shock model — shared injection episode, separate responses.
@@ -157,7 +152,7 @@ theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), -4.5])
 #         log10_RE, logF_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy]
 # All log* parameters are log10.
 # ===============================================================
-RS_WIDTH_LOG = 0.02
+RS_WIDTH_LOG = 0.05
 
 NAMES_INJECTION = [
     'logF0_FS', 'logTb_FS', 'logC_bg',
@@ -513,14 +508,14 @@ def print_params(title, theta_best, param_names, quantiles,
 _CORNER_CFG = {
     'FS': dict(
         names=NAMES_FS,
-        scale=[1e6, 1440, 1e6],
-        labels=[r'$F_b\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+        scale=[1e6, 1440, 1e6, 1],
+        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$S_{\rm FS}$'],
     ),
     'INJECTION': dict(
         names=NAMES_INJECTION,
         scale=[1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1],
-        labels=[r'$F_{b,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
                 r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
                 r'$t_s\ (\mathrm{d})$', r'$t_\times\ (\mathrm{d})$',
                 r'$R_E$', r'$F_{\rm RS}(t_\times)\ (\mu\mathrm{Jy})$',
@@ -530,7 +525,7 @@ _CORNER_CFG = {
     'CURVED_INJECTION': dict(
         names=NAMES_CURVED_INJECTION,
         scale=[1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1, 1],
-        labels=[r'$F_{b,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
                 r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
                 r'$t_s\ (\mathrm{d})$', r'$t_\times\ (\mathrm{d})$',
                 r'$R_E$', r'$F_{\rm RS}(t_\times)\ (\mu\mathrm{Jy})$',
@@ -1069,13 +1064,15 @@ if __name__ == '__main__':
     decay_best = decay_alpha_from_p(P_FIXED)
 
     print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
-                 ['F_b (uJy)', 'tb (min)', 'C_bg (uJy)'],
-                 [1e6, 1440, 1e6],
+                 ['F0 (uJy)', 'tb (min)', 'C_bg (uJy)', 'S_FS'],
+                 [1e6, 1440, 1e6, 1],
                  chi2_rFS)
     print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
     print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
     print(f"  {'decay slope':>24s}:    {-decay_best: .3f}   "
           f"(fixed by p={P_FIXED:.1f} as -3(p-1)/4)")
+    S_AB = pFS[3]
+    print(f"  {'S_FS for injection':>24s}:     {S_AB:.3f}   (fixed from FS-only fit)")
 
     # -----------------------------------------------------------
     # Corner plot
@@ -1109,7 +1106,7 @@ if __name__ == '__main__':
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock only: Granot-Sari nu_m crossing', fontsize=10)
+    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
     ax.legend(fontsize=6.5, loc='lower left')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
@@ -1154,7 +1151,7 @@ if __name__ == '__main__':
 
     print_params('FORWARD SHOCK ENERGY-INJECTION MODEL',
                  thetaInjection, NAMES_INJECTION, qInjection,
-                 ['F_b,FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
+                 ['F0_FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
                   't_start (d)', 't_cross (d)', 'R_E',
                   'F_RS(t_cross) (uJy)', 'RS rise alpha',
                   'RS decay alpha', 'f_E'],
@@ -1203,7 +1200,7 @@ if __name__ == '__main__':
 
         print_params('CURVED ENERGY-INJECTION ROBUSTNESS MODEL',
                      thetaCurved, NAMES_CURVED_INJECTION, qCurved,
-                     ['F_b,FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
+                     ['F0_FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
                       't_start (d)', 't_cross (d)', 'R_E',
                       'F_RS(t_cross) (uJy)', 'RS rise alpha',
                       'RS decay alpha', 'f_E', 'kappa'],
@@ -1247,7 +1244,7 @@ if __name__ == '__main__':
     # TESS background plot
     # -----------------------------------------------------------
     bg_models = [
-        ('Forward shock', chainFS, lpFS, theta_to_params_FS, -1),
+        ('Forward shock', chainFS, lpFS, theta_to_params_FS, 2),
         ('INJECTION', chainInjection, lpInjection, theta_to_params_injection, 2),
     ]
     if args.curved_injection:
