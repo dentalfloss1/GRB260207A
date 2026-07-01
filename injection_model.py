@@ -28,7 +28,7 @@ from astropy.time import Time
 # ---------------------------------------------------------------
 # Module-level constants  (available to subprocesses on spawn)
 # ---------------------------------------------------------------
-trigger_tjd = Time("2026-02-07 05:40:16.947").jd - 2457000
+trigger_tjd = Time("2026-02-07 05:42:33.65").jd - 2457000
 master_obs  = Time("2026-02-07 05:46:04.3")
 t_master    = master_obs.jd - 2457000 - trigger_tjd
 F_master    = 3276.0 * 10**(-0.4 * 17.3)
@@ -36,11 +36,11 @@ eF_master   = F_master * 0.30
 
 CADENCE    = 200 / 86400
 HALF_C     = CADENCE / 2
-S_AB       = 0.1
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
 INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
+INJECTION_MODEL_VERSION = 6  # Bump when injection sampler coordinates change.
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
@@ -83,29 +83,37 @@ def windowed_eval(model_fn, t_arr, params):
     return out
 
 # ===============================================================
-# Forward-shock model — SBPL + TESS-bg constant, S=0.1
-# theta: [logF0, logTb, p, logC_bg]
+# Forward-shock model — Granot & Sari nu_m crossing + TESS-bg constant
+# theta: [logF0, logTb, logC_bg]
 # ===============================================================
-FS_RISE_ALPHA = -0.5
+P_FIXED = 2.3
 
 def decay_alpha_from_p(p):
     return 3.0 * (p - 1.0) / 4.0
 
-def forward_shock_source_flux(t, F0, tb, p):
-    """Source-only forward-shock flux; zero before the trigger."""
+def granot_sari_s(p):
+    return 1.84 - 0.40 * p
+
+def forward_shock_source_flux(t, F_b, tb, p):
+    """Source-only FS flux for nu_m crossing the band; F_b is flux at t=tb."""
     t = np.asarray(t, dtype=float)
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
-    a2 = decay_alpha_from_p(p)
-    return np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, S_AB), 0.0)
+    if not (F_b > 0.0 and tb > 0.0 and p > 2.0):
+        return np.full_like(t, np.nan)
+    x = ts / tb
+    s = granot_sari_s(p)
+    term_rise = x**(-0.5 * s)
+    term_decay = x**(0.75 * s * (p - 1.0))
+    fs = F_b * ((term_rise + term_decay) / 2.0)**(-1.0 / s)
+    return np.where(pos, fs, 0.0)
 
-def model_FS(t, F0, tb, p, C_bg):
-    return forward_shock_source_flux(t, F0, tb, p) + C_bg
+def model_FS(t, F0, tb, C_bg):
+    return forward_shock_source_flux(t, F0, tb, P_FIXED) + C_bg
 
 PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
     'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
-    'p':       ( 2.1,  2.5),
     'logC_bg': (-10.0, -4.0),
 }
 NAMES_FS = list(PRIOR_FS.keys())
@@ -116,8 +124,8 @@ def log_prior_FS(theta):
     return 0.0
 
 def theta_to_params_FS(theta):
-    logF0, logTb, p, logC_bg = theta
-    return (10**logF0, 10**logTb, p, 10**logC_bg)
+    logF0, logTb, logC_bg = theta
+    return (10**logF0, 10**logTb, 10**logC_bg)
 
 def log_prob_FS(theta, x, y, yerr):
     lp = log_prior_FS(theta)
@@ -129,42 +137,44 @@ def log_prob_FS(theta, x, y, yerr):
     return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
 def get_components_FS(t, p):
-    # p: F0, tb, electron-index p, C_bg
-    a2  = decay_alpha_from_p(p[2])
-    fs  = forward_shock_source_flux(t, p[0], p[1], p[2])
-    cbg = np.full_like(t, p[3])
+    # p: F0, tb, C_bg
+    a2  = decay_alpha_from_p(P_FIXED)
+    fs  = forward_shock_source_flux(t, p[0], p[1], P_FIXED)
+    cbg = np.full_like(t, p[2])
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  p={p[2]:.2f}"),
+         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  "
+         f"p={P_FIXED:.2f}  s={granot_sari_s(P_FIXED):.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
-         f"C_bg={p[3]*1e6:.2f} µJy"),
+         f"C_bg={p[2]*1e6:.2f} µJy"),
     ]
 
-theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), 2.25, -4.5])
+theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), -4.5])
 
 # ===============================================================
 # Refreshed forward-shock model — shared injection episode, separate responses.
-# theta: [logF0_FS, logTb_FS, p, logC_bg, t_start, t_cross,
-#         log_RE, logF_RS_cross, f_energy]
-# log_RE is a natural log; other log* parameters are log10.
+# theta: [logF0_FS, logTb_FS, logC_bg, t_start, t_cross,
+#         log10_RE, logF_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy]
+# All log* parameters are log10.
 # ===============================================================
-RS_WIDTH_LOG = 0.08
-RS_RISE_ALPHA = -0.5
+RS_WIDTH_LOG = 0.02
 
 NAMES_INJECTION = [
-    'logF0_FS', 'logTb_FS', 'p', 'logC_bg',
-    't_start', 't_cross', 'log_RE', 'logF_RS_cross', 'f_energy',
+    'logF0_FS', 'logTb_FS', 'logC_bg',
+    't_start', 't_cross', 'log10_RE', 'logF_RS_cross',
+    'alpha_RS_rise', 'alpha_RS_decay', 'f_energy',
 ]
 
 PRIOR_INJECTION = {
     'logF0_FS': (-6.0, -2.3),
     'logTb_FS': (-2.523, -1.699),
-    'p': (2.1, 2.5),
     'logC_bg': (-10.0, -4.0),
     't_start': (0.012, 0.030),
     't_cross': (0.038, 0.060),
-    'log_RE': (np.log(1.0001), np.log(10.0)),
+    'log10_RE': (np.log10(1.0001), np.log10(10.0)),
     'logF_RS_cross': (-8.0, -2.0),
+    'alpha_RS_rise': (0.05, 5.0),
+    'alpha_RS_decay': (0.05, 8.0),
     'f_energy': (0.1, 0.8),
 }
 
@@ -172,60 +182,96 @@ def energy_flux_index(p):
     """ISM, slow cooling, nu_m < nu_TESS < nu_c."""
     return (p + 3.0) / 4.0
 
-def energy_ratio_injection(t, t_start, t_energy_end, log_RE):
+def energy_ratio_injection(t, t_start, t_energy_end, log10_RE):
     """Single-stage log-linear cumulative blast-wave energy history."""
     t = np.asarray(t, dtype=float)
     if not (0.0 < t_start < t_energy_end):
         raise ValueError("Require 0 < t_start < t_energy_end")
 
-    RE = np.exp(log_RE)
+    RE = 10**log10_RE
     ratio = np.ones_like(t)
 
     during = (t >= t_start) & (t < t_energy_end)
     if np.any(during):
-        progress = np.log(t[during] / t_start) / np.log(t_energy_end / t_start)
-        ratio[during] = np.exp(log_RE * progress)
+        progress = np.log10(t[during] / t_start) / np.log10(t_energy_end / t_start)
+        ratio[during] = 10**(log10_RE * progress)
 
     ratio[t >= t_energy_end] = RE
     return ratio
 
-def reverse_shock_decay_alpha(p):
-    return (73.0 * p + 21.0) / 96.0
+def energy_ratio_curved_injection(t, t_start, t_energy_end, log10_RE, kappa):
+    """One-parameter curved cumulative energy history in log10 time."""
+    t = np.asarray(t, dtype=float)
+    if not (0.0 < t_start < t_energy_end):
+        raise ValueError("Require 0 < t_start < t_energy_end")
 
-def reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross, p,
+    RE = 10**log10_RE
+    ratio = np.ones_like(t)
+
+    during = (t >= t_start) & (t < t_energy_end)
+    if np.any(during):
+        u = np.log10(t[during] / t_start) / np.log10(t_energy_end / t_start)
+        curved_progress = u + kappa * u * (1.0 - u)
+        ratio[during] = 10**(log10_RE * curved_progress)
+
+    ratio[t >= t_energy_end] = RE
+    return ratio
+
+def reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross,
+                       alpha_rise, alpha_decay,
                        S=RS_WIDTH_LOG):
     """Plain shifted-time reverse shock SBPL, normalized to peak at t_cross."""
     t = np.asarray(t, dtype=float)
     if not (0.0 < t_start < t_cross):
         raise ValueError("Require 0 < t_start < t_cross")
+    if not (alpha_rise > 0.0 and alpha_decay > 0.0):
+        raise ValueError("Require positive reverse-shock slopes")
 
     tau_cross = t_cross - t_start
     tau = np.maximum(t - t_start, np.finfo(float).tiny)
 
-    decay_alpha = reverse_shock_decay_alpha(p)
-    peak_ratio = ((-RS_RISE_ALPHA) / decay_alpha)**S
+    peak_ratio = (alpha_rise / alpha_decay)**S
     tb = tau_cross / peak_ratio
     norm = sbpl(np.array([tau_cross]), F_RS_cross, tb,
-                RS_RISE_ALPHA, decay_alpha, S)[0]
+                -alpha_rise, alpha_decay, S)[0]
     if not np.isfinite(norm) or norm <= 0:
         raise ValueError("Invalid reverse-shock normalization")
-    return F_RS_cross * sbpl(tau, F_RS_cross, tb, RS_RISE_ALPHA, decay_alpha, S) / norm
+    return F_RS_cross * sbpl(tau, F_RS_cross, tb,
+                             -alpha_rise, alpha_decay, S) / norm
 
-def model_injection(t, F0_FS, tb_FS, p_FS, C_bg,
-                    t_start, t_cross, log_RE, F_RS_cross, f_energy):
+def model_injection(t, F0_FS, tb_FS, C_bg,
+                    t_start, t_cross, log10_RE, F_RS_cross,
+                    alpha_RS_rise, alpha_RS_decay, f_energy):
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
-    e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log_RE)
-    rs = reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross, p_FS)
-    return f_fs0 * e_ratio**energy_flux_index(p_FS) + rs + C_bg
+    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log10_RE)
+    rs = reverse_shock_sbpl(
+        t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
+    return f_fs0 * e_ratio**energy_flux_index(P_FIXED) + rs + C_bg
+
+NAMES_CURVED_INJECTION = NAMES_INJECTION + ['kappa']
+PRIOR_CURVED_INJECTION = dict(PRIOR_INJECTION)
+PRIOR_CURVED_INJECTION['kappa'] = (-1.0, 1.0)
+
+def model_curved_injection(t, F0_FS, tb_FS, C_bg,
+                           t_start, t_cross, log10_RE, F_RS_cross,
+                           alpha_RS_rise, alpha_RS_decay, f_energy, kappa):
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
+    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    e_ratio = energy_ratio_curved_injection(
+        t, t_start, t_energy_end, log10_RE, kappa)
+    rs = reverse_shock_sbpl(
+        t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
+    return f_fs0 * e_ratio**energy_flux_index(P_FIXED) + rs + C_bg
 
 def log_prior_injection(theta):
     for v, (lo, hi) in zip(theta, PRIOR_INJECTION.values()):
         if not (lo <= v <= hi):
             return -np.inf
 
-    (logF0_FS, logTb_FS, p_FS, logC_bg,
-     t_start, t_cross, log_RE, logF_RS_cross, f_energy) = theta
+    (logF0_FS, logTb_FS, logC_bg,
+     t_start, t_cross, log10_RE, logF_RS_cross,
+     alpha_RS_rise, alpha_RS_decay, f_energy) = theta
     tb = 10**logTb_FS
     t_energy_end = t_start + f_energy * (t_cross - t_start)
 
@@ -235,10 +281,12 @@ def log_prior_injection(theta):
     return 0.0
 
 def theta_to_params_injection(theta):
-    (logF0_FS, logTb_FS, p_FS, logC_bg,
-     t_start, t_cross, log_RE, logF_RS_cross, f_energy) = theta
-    return (10**logF0_FS, 10**logTb_FS, p_FS, 10**logC_bg,
-            t_start, t_cross, log_RE, 10**logF_RS_cross, f_energy)
+    (logF0_FS, logTb_FS, logC_bg,
+     t_start, t_cross, log10_RE, logF_RS_cross,
+     alpha_RS_rise, alpha_RS_decay, f_energy) = theta
+    return (10**logF0_FS, 10**logTb_FS, 10**logC_bg,
+            t_start, t_cross, log10_RE, 10**logF_RS_cross,
+            alpha_RS_rise, alpha_RS_decay, f_energy)
 
 def log_prob_injection(theta, x, y, yerr):
     lp = log_prior_injection(theta)
@@ -253,42 +301,103 @@ def log_prob_injection(theta, x, y, yerr):
         return -np.inf
     return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
+def log_prior_curved_injection(theta):
+    for v, (lo, hi) in zip(theta, PRIOR_CURVED_INJECTION.values()):
+        if not (lo <= v <= hi):
+            return -np.inf
+
+    (logF0_FS, logTb_FS, logC_bg,
+     t_start, t_cross, log10_RE, logF_RS_cross,
+     alpha_RS_rise, alpha_RS_decay, f_energy, kappa) = theta
+    tb = 10**logTb_FS
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
+
+    if not (tb < t_start < t_energy_end < t_cross < 0.10):
+        return -np.inf
+
+    return 0.0
+
+def theta_to_params_curved_injection(theta):
+    (logF0_FS, logTb_FS, logC_bg,
+     t_start, t_cross, log10_RE, logF_RS_cross,
+     alpha_RS_rise, alpha_RS_decay, f_energy, kappa) = theta
+    return (10**logF0_FS, 10**logTb_FS, 10**logC_bg,
+            t_start, t_cross, log10_RE, 10**logF_RS_cross,
+            alpha_RS_rise, alpha_RS_decay, f_energy, kappa)
+
+def log_prob_curved_injection(theta, x, y, yerr):
+    lp = log_prior_curved_injection(theta)
+    if not np.isfinite(lp):
+        return -np.inf
+    params = theta_to_params_curved_injection(theta)
+    try:
+        ymod = windowed_eval(model_curved_injection, x, params)
+    except Exception:
+        return -np.inf
+    if not np.all(np.isfinite(ymod)):
+        return -np.inf
+    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
+
 def theta0_injection_from_fs(theta_FS_best):
     theta0 = np.array([
         theta_FS_best[0],
         theta_FS_best[1],
         theta_FS_best[2],
-        theta_FS_best[3],
         0.018,
         0.046,
-        np.log(2.9),
+        np.log10(2.9),
         np.log10(1e-5),
+        0.50,
+        2.0,
         0.30,
     ])
     for j, (lo, hi) in enumerate(PRIOR_INJECTION.values()):
         theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
-    if theta0[5] <= theta0[4]:
-        theta0[5] = min(PRIOR_INJECTION['t_cross'][1] - 1e-4, theta0[4] + 0.020)
+    if theta0[4] <= theta0[3]:
+        theta0[4] = min(PRIOR_INJECTION['t_cross'][1] - 1e-4, theta0[3] + 0.020)
     return theta0
 
 def get_components_injection(t, p):
-    (F0_FS, tb_FS, p_FS, C_bg, t_start, t_cross, log_RE,
-     F_RS_cross, f_energy) = p
+    (F0_FS, tb_FS, C_bg, t_start, t_cross, log10_RE,
+     F_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy) = p
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
-    e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log_RE)
-    fs_refreshed = fs0 * e_ratio**energy_flux_index(p_FS)
-    rs = reverse_shock_sbpl(t, F_RS_cross, t_start, t_cross, p_FS)
+    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log10_RE)
+    fs_refreshed = fs0 * e_ratio**energy_flux_index(P_FIXED)
+    rs = reverse_shock_sbpl(
+        t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
     cbg = np.full_like(t, C_bg)
-    decay_alpha = reverse_shock_decay_alpha(p_FS)
     return [
         ('Unrefreshed FS', fs0 + C_bg, '--', 'dimgray',
-         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(p_FS):.2f}"),
+         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_FIXED):.2f}"),
         ('Refreshed FS', fs_refreshed + C_bg, '-', 'darkorange',
-         f"R_E={np.exp(log_RE):.2f}"),
+         f"R_E={10**log10_RE:.2f}"),
         ('Reverse shock', rs, ':', 'crimson',
          f"F(t_cross)={F_RS_cross*1e6:.2f} uJy  "
-         f"rise=+0.50  decay=-{decay_alpha:.2f}"),
+         f"rise=+{alpha_RS_rise:.2f}  decay=-{alpha_RS_decay:.2f}"),
+        ('TESS bg', cbg, '-.', 'mediumseagreen',
+         f"C_bg={C_bg*1e6:.2f} uJy"),
+    ]
+
+def get_components_curved_injection(t, p):
+    (F0_FS, tb_FS, C_bg, t_start, t_cross, log10_RE,
+     F_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy, kappa) = p
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
+    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    e_ratio = energy_ratio_curved_injection(
+        t, t_start, t_energy_end, log10_RE, kappa)
+    fs_refreshed = fs0 * e_ratio**energy_flux_index(P_FIXED)
+    rs = reverse_shock_sbpl(
+        t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
+    cbg = np.full_like(t, C_bg)
+    return [
+        ('Unrefreshed FS', fs0 + C_bg, '--', 'dimgray',
+         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_FIXED):.2f}"),
+        ('Curved refreshed FS', fs_refreshed + C_bg, '-', 'teal',
+         f"R_E={10**log10_RE:.2f}  kappa={kappa:.2f}"),
+        ('Reverse shock', rs, ':', 'crimson',
+         f"F(t_cross)={F_RS_cross*1e6:.2f} uJy  "
+         f"rise=+{alpha_RS_rise:.2f}  decay=-{alpha_RS_decay:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={C_bg*1e6:.2f} uJy"),
     ]
@@ -362,14 +471,13 @@ def _fit_injection(xD, yD, yeD, theta0_injection, quick=False):
     return run_emcee(xD, yD, yeD, theta0_injection, PRIOR_INJECTION,
                      log_prob_injection, 'FS energy injection', quick=quick)
 
-# ---------------------------------------------------------------
-# Summarize flat chains
-# ---------------------------------------------------------------
-NATURAL_LOG_PARAMS = {'log_RE'}
+def _fit_curved_injection(xD, yD, yeD, theta0_curved, quick=False):
+    np.random.seed(63)
+    return run_emcee(xD, yD, yeD, theta0_curved, PRIOR_CURVED_INJECTION,
+                     log_prob_curved_injection, 'FS curved energy injection',
+                     quick=quick)
 
 def theta_column_to_phys(name, values):
-    if name in NATURAL_LOG_PARAMS:
-        return np.exp(values)
     if name.startswith('log'):
         return 10**values
     return values
@@ -405,20 +513,104 @@ def print_params(title, theta_best, param_names, quantiles,
 _CORNER_CFG = {
     'FS': dict(
         names=NAMES_FS,
-        scale=[1e6, 1440, 1, 1e6],
-        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
-                r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+        scale=[1e6, 1440, 1e6],
+        labels=[r'$F_b\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
     'INJECTION': dict(
         names=NAMES_INJECTION,
-        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1],
-        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
-                r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
+        scale=[1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1],
+        labels=[r'$F_{b,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
                 r'$t_s\ (\mathrm{d})$', r'$t_\times\ (\mathrm{d})$',
                 r'$R_E$', r'$F_{\rm RS}(t_\times)\ (\mu\mathrm{Jy})$',
+                r'$\alpha_{\rm RS,rise}$', r'$\alpha_{\rm RS,decay}$',
                 r'$f_E$'],
     ),
+    'CURVED_INJECTION': dict(
+        names=NAMES_CURVED_INJECTION,
+        scale=[1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1, 1],
+        labels=[r'$F_{b,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$',
+                r'$t_s\ (\mathrm{d})$', r'$t_\times\ (\mathrm{d})$',
+                r'$R_E$', r'$F_{\rm RS}(t_\times)\ (\mu\mathrm{Jy})$',
+                r'$\alpha_{\rm RS,rise}$', r'$\alpha_{\rm RS,decay}$',
+                r'$f_E$', r'$\kappa$'],
+    ),
 }
+
+_INJECTION_CORNER_DPI = 180
+_INJECTION_CORNER_FIGSIZE = (2700 / _INJECTION_CORNER_DPI,
+                             2730 / _INJECTION_CORNER_DPI)
+_INJECTION_CORNER_FONT_CANDIDATES = (
+    (30, 24, 19),
+    (29, 23, 19),
+    (28, 23, 18),
+    (27, 22, 18),
+    (26, 21, 17),
+    (25, 20, 16),
+    (24, 19, 16),
+    (23, 18, 15),
+    (22, 17, 14),
+    (21, 16, 14),
+    (20, 16, 13),
+    (19, 15, 13),
+)
+
+def _compact_corner_titles(samples, fmt='.2f'):
+    titles = []
+    for values in samples.T:
+        q16, q50, q84 = np.percentile(values, [16, 50, 84])
+        titles.append(
+            r'${{{median:{fmt}}}}^{{+{upper:{fmt}}}}_{{-{lower:{fmt}}}}$'.format(
+                median=q50, upper=q84 - q50, lower=q50 - q16, fmt=fmt
+            )
+        )
+    return titles
+
+def _texts_overlap(fig):
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    canvas = fig.bbox.expanded(0.98, 0.98)
+    boxes = []
+    for ax in fig.axes:
+        for text in (*ax.get_xticklabels(), *ax.get_yticklabels(),
+                     ax.xaxis.get_offset_text(), ax.yaxis.get_offset_text(),
+                     ax.xaxis.label, ax.yaxis.label, ax.title):
+            if not text.get_visible() or not text.get_text():
+                continue
+            box = text.get_window_extent(renderer=renderer)
+            if box.width > 0 and box.height > 0:
+                if not canvas.contains(*box.p0) or not canvas.contains(*box.p1):
+                    return True
+                boxes.append(box.expanded(1.16, 1.28))
+    for i, box in enumerate(boxes):
+        if any(box.overlaps(other) for other in boxes[i + 1:]):
+            return True
+    return False
+
+def _set_corner_text_sizes(fig, label_size, title_size, tick_size):
+    for ax in fig.axes:
+        ax.tick_params(axis='both', labelsize=tick_size, pad=1)
+        ax.xaxis.label.set_size(label_size)
+        ax.yaxis.label.set_size(label_size)
+        ax.xaxis.get_offset_text().set_size(tick_size)
+        ax.yaxis.get_offset_text().set_size(tick_size)
+        ax.xaxis.labelpad = 7
+        ax.yaxis.labelpad = 7
+        ax.title.set_size(title_size)
+
+def _fit_injection_corner_text(fig):
+    for label_size, title_size, tick_size in _INJECTION_CORNER_FONT_CANDIDATES:
+        _set_corner_text_sizes(fig, label_size, title_size, tick_size)
+        if not _texts_overlap(fig):
+            return
+    _set_corner_text_sizes(fig, *_INJECTION_CORNER_FONT_CANDIDATES[-1])
+
+def _set_injection_corner_titles(fig, titles):
+    axes = np.array(fig.axes).reshape((len(titles), len(titles)))
+    for i, title in enumerate(titles):
+        axes[i, i].set_title(title)
 
 def save_corner(tag, flat_chain):
     try:
@@ -430,16 +622,30 @@ def save_corner(tag, flat_chain):
     samp = flat_chain.copy()
     for j, (name, sc) in enumerate(zip(cfg['names'], cfg['scale'])):
         samp[:, j] = theta_column_to_phys(name, samp[:, j]) * sc
+    is_injection = tag in {'INJECTION', 'CURVED_INJECTION'}
+    fig = plt.figure(figsize=_INJECTION_CORNER_FIGSIZE,
+                     dpi=_INJECTION_CORNER_DPI) if is_injection else None
+    corner_kwargs = dict(
+        labels=cfg['labels'],
+        quantiles=[0.16, 0.5, 0.84],
+        show_titles=not is_injection,
+        title_fmt='.2f',
+        label_kwargs={'fontsize': 26 if is_injection else 15, 'labelpad': 5 if is_injection else 8},
+        title_kwargs={'fontsize': 21 if is_injection else 13},
+        fig=fig,
+    )
     try:
         with plt.rc_context({'text.usetex': True}):
-            fig_c = corner.corner(samp, labels=cfg['labels'],
-                                  quantiles=[0.16, 0.5, 0.84], show_titles=True,
-                                  title_fmt='.2f', label_kwargs={'fontsize': 9})
+            fig_c = corner.corner(samp, **corner_kwargs)
     except Exception:
-        fig_c = corner.corner(samp, labels=cfg['labels'],
-                              quantiles=[0.16, 0.5, 0.84], show_titles=True,
-                              title_fmt='.2f', label_kwargs={'fontsize': 9})
-    fig_c.savefig(f'GRB260207A_corner_{tag}.png', dpi=110, bbox_inches='tight')
+        fig_c = corner.corner(samp, **corner_kwargs)
+    if is_injection:
+        _set_injection_corner_titles(fig_c, _compact_corner_titles(samp, corner_kwargs['title_fmt']))
+        _fit_injection_corner_text(fig_c)
+        fig_c.savefig(f'GRB260207A_corner_{tag}.png', dpi=_INJECTION_CORNER_DPI)
+    else:
+        _set_corner_text_sizes(fig_c, 15, 13, 11)
+        fig_c.savefig(f'GRB260207A_corner_{tag}.png', dpi=160, bbox_inches='tight')
     plt.close(fig_c)
     print(f"Saved: GRB260207A_corner_{tag}.png")
 
@@ -447,7 +653,11 @@ def save_corner(tag, flat_chain):
 # Plotting helpers  (reference x_plot/y_plot/ye_plot as module globals
 #                    set inside __main__ before these are ever called)
 # ---------------------------------------------------------------
-MODEL_COLOR = {'FS': 'royalblue', 'INJECTION': 'navy'}
+MODEL_COLOR = {
+    'FS': 'royalblue',
+    'INJECTION': 'navy',
+    'CURVED_INJECTION': 'darkviolet',
+}
 
 def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
     pos          = y_plot > 0
@@ -559,8 +769,8 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
     color = MODEL_COLOR['INJECTION']
 
     fig, (ax, ax_res) = plt.subplots(
-        2, 1, figsize=(8, 9),
-        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
+        2, 1, figsize=(8, 9), sharex=True,
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.0})
 
     add_data_to_ax(ax, mask_injection_fit)
 
@@ -578,7 +788,7 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
         ax.plot(t_model, np.where(cy > 0, cy, np.nan),
                 color=ccolor, ls=ls, lw=1.6, zorder=6, label=f'{clabel}: {desc}')
 
-    t_start, t_cross, f_energy = p_best[4], p_best[5], p_best[8]
+    t_start, t_cross, f_energy = p_best[3], p_best[4], p_best[9]
     t_energy_end = t_start + f_energy * (t_cross - t_start)
     for tx, lbl in [(t_start, r'$t_s$'), (t_energy_end, r'$t_E$'),
                     (t_cross, r'$t_\times$')]:
@@ -587,6 +797,8 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
 
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
+    ax.spines['bottom'].set_visible(False)
+    ax_res.spines['top'].set_visible(False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
     ax.set_title('Refreshed forward shock with tied reverse-shock component', fontsize=10)
     ax.legend(fontsize=5.9, loc='best')
@@ -597,6 +809,54 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
     plt.savefig('GRB260207A_emcee_injection.png', dpi=130, bbox_inches='tight')
     plt.close()
     print("Saved: GRB260207A_emcee_injection.png")
+
+def save_curved_injection_plot(mask_injection_fit, chain, lp, chi2_r):
+    p_best = theta_to_params_curved_injection(chain[np.argmax(lp)])
+    t_model = np.logspace(np.log10(2e-4), np.log10(13), 1500)
+    color = MODEL_COLOR['CURVED_INJECTION']
+
+    fig, (ax, ax_res) = plt.subplots(
+        2, 1, figsize=(8, 9), sharex=True,
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.0})
+
+    add_data_to_ax(ax, mask_injection_fit)
+
+    rng = np.random.default_rng(63)
+    for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
+        y_samp = model_curved_injection(
+            t_model, *theta_to_params_curved_injection(chain[i]))
+        ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
+                '-', color=color, lw=0.3, alpha=0.035, zorder=4)
+
+    y_best = model_curved_injection(t_model, *p_best)
+    ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
+            '-', color=color, lw=2.4, zorder=7,
+            label=f'Best fit  chi2_r={chi2_r:.2f}')
+    for (clabel, cy, ls, ccolor, desc) in get_components_curved_injection(t_model, p_best):
+        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
+                color=ccolor, ls=ls, lw=1.6, zorder=6, label=f'{clabel}: {desc}')
+
+    t_start, t_cross, f_energy = p_best[3], p_best[4], p_best[9]
+    t_energy_end = t_start + f_energy * (t_cross - t_start)
+    for tx, lbl in [(t_start, r'$t_s$'), (t_energy_end, r'$t_E$'),
+                    (t_cross, r'$t_\times$')]:
+        ax.axvline(tx, color='dimgray', ls=':', lw=0.9, alpha=0.75,
+                   label=f'{lbl}={tx:.4f} d')
+
+    format_main_ax(ax)
+    ax.tick_params(labelbottom=False)
+    ax.spines['bottom'].set_visible(False)
+    ax_res.spines['top'].set_visible(False)
+    ax.set_ylabel('Flux density (Jy)', fontsize=11)
+    ax.set_title('Curved refreshed forward shock robustness model', fontsize=10)
+    ax.legend(fontsize=5.7, loc='best')
+    add_minutes_axis(ax)
+    plot_residuals(ax_res, mask_injection_fit, model_curved_injection, p_best, color)
+
+    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
+    plt.savefig('GRB260207A_emcee_curved_injection.png', dpi=130, bbox_inches='tight')
+    plt.close()
+    print("Saved: GRB260207A_emcee_curved_injection.png")
 
 def save_background_plot(bg_models, output_path='GRB260207A_tess_bg.png'):
     """Dedicated plot of the TESS background constant.
@@ -670,6 +930,8 @@ if __name__ == '__main__':
     parser.add_argument('--quick',   action='store_true',
                         help=f'Fast test run (nburn={_QUICK_NBURN}, nprod={_QUICK_NPROD}); '
                              f'normal mode uses adaptive stopping')
+    parser.add_argument('--curved-injection', action='store_true',
+                        help='Also run an opt-in one-parameter curved energy-injection robustness fit.')
     args = parser.parse_args()
 
     rawdata   = np.loadtxt('lc_GRB260207A_cand41148_geo')
@@ -715,7 +977,7 @@ if __name__ == '__main__':
                 w    = 1.0 / ye_s[in_bin]**2
                 y_b  = np.sum(w * y_s[in_bin]) / np.sum(w)
                 ye_b = np.sqrt(1.0 / np.sum(w))
-                x_b  = np.exp(np.mean(np.log(x_s[in_bin])))
+                x_b  = 10**np.mean(np.log10(x_s[in_bin]))
                 x_binned.append(x_b); y_binned.append(y_b); ye_binned.append(ye_b)
         x_binned  = np.array(x_binned)
         y_binned  = np.array(y_binned)
@@ -804,15 +1066,16 @@ if __name__ == '__main__':
     npar = len(NAMES_FS)
     chi2_FS  = -2*np.max(lpFS)
     chi2_rFS = chi2_FS / (N - npar)
-    decay_best = decay_alpha_from_p(pFS[2])
+    decay_best = decay_alpha_from_p(P_FIXED)
 
     print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
-                 ['F0 (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
-                 [1e6, 1440, 1, 1e6],
+                 ['F_b (uJy)', 'tb (min)', 'C_bg (uJy)'],
+                 [1e6, 1440, 1e6],
                  chi2_rFS)
+    print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
     print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
     print(f"  {'decay slope':>24s}:    {-decay_best: .3f}   "
-          f"(fixed by best-fit p as -3(p-1)/4)")
+          f"(fixed by p={P_FIXED:.1f} as -3(p-1)/4)")
 
     # -----------------------------------------------------------
     # Corner plot
@@ -846,7 +1109,7 @@ if __name__ == '__main__':
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
+    ax.set_title('Forward shock only: Granot-Sari nu_m crossing', fontsize=10)
     ax.legend(fontsize=6.5, loc='lower left')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
@@ -867,15 +1130,15 @@ if __name__ == '__main__':
     theta0_injection = theta0_injection_from_fs(thetaFS)
 
     print("\nEnergy-injection initial guess:")
-    print(f"  {'t_start':>18s}: {theta0_injection[4]:9.5f} d")
-    print(f"  {'t_cross':>18s}: {theta0_injection[5]:9.5f} d")
+    print(f"  {'t_start':>18s}: {theta0_injection[3]:9.5f} d")
+    print(f"  {'t_cross':>18s}: {theta0_injection[4]:9.5f} d")
     print(f"  {'t_E':>18s}: "
-          f"{theta0_injection[4] + theta0_injection[8]*(theta0_injection[5]-theta0_injection[4]):9.5f} d")
-    print(f"  {'R_E':>18s}: {np.exp(theta0_injection[6]):9.3f}")
-    print(f"  {'F_RS(t_cross)':>18s}: {10**theta0_injection[7]*1e6:9.3f} uJy")
-    print(f"  {'f_E':>18s}: {theta0_injection[8]:9.3f}")
-    print(f"  {'RS rise':>18s}: {0.5:9.3f}   (fixed)")
-    print(f"  {'RS decay':>18s}: {reverse_shock_decay_alpha(theta0_injection[2]):9.3f}   (fixed by p)")
+          f"{theta0_injection[3] + theta0_injection[9]*(theta0_injection[4]-theta0_injection[3]):9.5f} d")
+    print(f"  {'R_E':>18s}: {10**theta0_injection[5]:9.3f}")
+    print(f"  {'F_RS(t_cross)':>18s}: {10**theta0_injection[6]*1e6:9.3f} uJy")
+    print(f"  {'RS rise alpha':>18s}: {theta0_injection[7]:9.3f}")
+    print(f"  {'RS decay alpha':>18s}: {theta0_injection[8]:9.3f}")
+    print(f"  {'f_E':>18s}: {theta0_injection[9]:9.3f}")
 
     print(f"\nN_injection_fit = {len(xI)},  t in "
           f"[{xI.min()*1440:.2f} min, {xI.max():.3f} d]")
@@ -891,21 +1154,22 @@ if __name__ == '__main__':
 
     print_params('FORWARD SHOCK ENERGY-INJECTION MODEL',
                  thetaInjection, NAMES_INJECTION, qInjection,
-                 ['F0_FS (uJy)', 'tb_FS (min)', 'p', 'C_bg (uJy)',
+                 ['F_b,FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
                   't_start (d)', 't_cross (d)', 'R_E',
-                  'F_RS(t_cross) (uJy)', 'f_E'],
-                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1e6, 1],
+                  'F_RS(t_cross) (uJy)', 'RS rise alpha',
+                  'RS decay alpha', 'f_E'],
+                 [1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1],
                  chi2_rInjection)
+    print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
 
-    (F0_FS, tb_FS, p_FS, C_bg, t_start, t_cross, log_RE,
-     F_RS_cross, f_energy) = pInjection
+    (F0_FS, tb_FS, C_bg, t_start, t_cross, log10_RE,
+     F_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy) = pInjection
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    g = energy_flux_index(p_FS)
-    RE = np.exp(log_RE)
-    e = log_RE / np.log(t_energy_end / t_start)
-    alpha_fs = decay_alpha_from_p(p_FS)
+    g = energy_flux_index(P_FIXED)
+    RE = 10**log10_RE
+    e = log10_RE / np.log10(t_energy_end / t_start)
+    alpha_fs = decay_alpha_from_p(P_FIXED)
     fs_injection_slope = -alpha_fs + g * e
-    rs_decay = reverse_shock_decay_alpha(p_FS)
     print("\nDerived injection diagnostics:")
     print(f"  {'g=(p+3)/4':>24s}: {g:9.3f}")
     print(f"  {'R_E':>24s}: {RE:9.3f}")
@@ -917,9 +1181,63 @@ if __name__ == '__main__':
     print(f"  {'t_cross-t_start (min)':>24s}: {(t_cross-t_start)*1440:9.3f}")
     print(f"  {'F_RS(t_cross) (uJy)':>24s}: {F_RS_cross*1e6:9.3f}")
     print(f"  {'f_E':>24s}: {f_energy:9.3f}")
-    print(f"  {'RS rise':>24s}: {0.5:9.3f}   (fixed)")
-    print(f"  {'RS decay alpha':>24s}: {rs_decay:9.3f}   (flux ∝ tau^-alpha)")
-    print(f"  {'RS flux slope':>24s}: {-rs_decay:9.3f}")
+    print(f"  {'RS rise alpha':>24s}: {alpha_RS_rise:9.3f}   (flux ∝ tau^+alpha)")
+    print(f"  {'RS decay alpha':>24s}: {alpha_RS_decay:9.3f}   (flux ∝ tau^-alpha)")
+    print(f"  {'RS flux decay slope':>24s}: {-alpha_RS_decay:9.3f}")
+
+    if args.curved_injection:
+        theta0_curved = np.append(thetaInjection, 0.0)
+        print("\nLaunching curved energy-injection robustness fit "
+              f"({mode_str}, kappa in [-1, 1])...")
+        chainCurved, lpCurved = _fit_curved_injection(
+            xI, yI, yeI, theta0_curved, args.quick)
+
+        thetaCurved, pCurved, qCurved = summarize(
+            chainCurved, lpCurved, theta_to_params_curved_injection,
+            NAMES_CURVED_INJECTION)
+        ymod_curved = windowed_eval(model_curved_injection, xI, pCurved)
+        chi2_curved = np.sum(((yI - ymod_curved) / yeI)**2)
+        chi2_rCurved = chi2_curved / (len(xI) - len(NAMES_CURVED_INJECTION))
+        bic_straight = chi2_injection + len(NAMES_INJECTION) * np.log(len(xI))
+        bic_curved = chi2_curved + len(NAMES_CURVED_INJECTION) * np.log(len(xI))
+
+        print_params('CURVED ENERGY-INJECTION ROBUSTNESS MODEL',
+                     thetaCurved, NAMES_CURVED_INJECTION, qCurved,
+                     ['F_b,FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
+                      't_start (d)', 't_cross (d)', 'R_E',
+                      'F_RS(t_cross) (uJy)', 'RS rise alpha',
+                      'RS decay alpha', 'f_E', 'kappa'],
+                     [1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1, 1],
+                     chi2_rCurved)
+        print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
+
+        (F0_FS_c, tb_FS_c, C_bg_c, t_start_c, t_cross_c,
+         log10_RE_c, F_RS_cross_c, alpha_RS_rise_c, alpha_RS_decay_c,
+         f_energy_c, kappa_c) = pCurved
+        t_energy_end_c = t_start_c + f_energy_c * (t_cross_c - t_start_c)
+        g_c = energy_flux_index(P_FIXED)
+        RE_c = 10**log10_RE_c
+        e_c = log10_RE_c / np.log10(t_energy_end_c / t_start_c)
+
+        print("\nCurved injection diagnostics:")
+        print(f"  {'kappa best-fit':>24s}: {kappa_c:9.3f}")
+        print(f"  {'R_E':>24s}: {RE_c:9.3f}")
+        print(f"  {'linear energy index e':>24s}: {e_c:9.3f}")
+        print(f"  {'final FS flux boost':>24s}: {RE_c**g_c:9.3f}")
+        print(f"  {'t_E-t_start (min)':>24s}: {(t_energy_end_c-t_start_c)*1440:9.3f}")
+        print(f"  {'t_cross-t_E (min)':>24s}: {(t_cross_c-t_energy_end_c)*1440:9.3f}")
+        print(f"  {'RS rise alpha':>24s}: {alpha_RS_rise_c:9.3f}   (flux ∝ tau^+alpha)")
+        print(f"  {'RS decay alpha':>24s}: {alpha_RS_decay_c:9.3f}   (flux ∝ tau^-alpha)")
+        print(f"  {'chi2 straight':>24s}: {chi2_injection:9.3f}")
+        print(f"  {'chi2 curved':>24s}: {chi2_curved:9.3f}")
+        print(f"  {'delta chi2 curved-straight':>24s}: {chi2_curved-chi2_injection:9.3f}")
+        print(f"  {'BIC straight':>24s}: {bic_straight:9.3f}")
+        print(f"  {'BIC curved':>24s}: {bic_curved:9.3f}")
+        print(f"  {'delta BIC curved-straight':>24s}: {bic_curved-bic_straight:9.3f}")
+
+        save_corner('CURVED_INJECTION', chainCurved)
+        save_curved_injection_plot(mask_injection_fit, chainCurved, lpCurved,
+                                   chi2_rCurved)
 
     save_corner('INJECTION', chainInjection)
     save_injection_plot(mask_injection_fit, chainInjection, lpInjection,
@@ -928,7 +1246,13 @@ if __name__ == '__main__':
     # -----------------------------------------------------------
     # TESS background plot
     # -----------------------------------------------------------
-    save_background_plot([
+    bg_models = [
         ('Forward shock', chainFS, lpFS, theta_to_params_FS, -1),
-        ('INJECTION', chainInjection, lpInjection, theta_to_params_injection, 3),
-    ], output_path='GRB260207A_tess_bg_injection.png')
+        ('INJECTION', chainInjection, lpInjection, theta_to_params_injection, 2),
+    ]
+    if args.curved_injection:
+        bg_models.append(
+            ('CURVED_INJECTION', chainCurved, lpCurved,
+             theta_to_params_curved_injection, 2)
+        )
+    save_background_plot(bg_models, output_path='GRB260207A_tess_bg_injection.png')

@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from astropy.time import Time
 
 
-trigger_tjd = Time("2026-02-07 05:40:16.947").jd - 2457000
+trigger_tjd = Time("2026-02-07 05:42:33.65").jd - 2457000
 
 rawdata = np.loadtxt("lc_GRB260207A_cand41148_geo")
 dt_burst = rawdata[:, 0] - trigger_tjd

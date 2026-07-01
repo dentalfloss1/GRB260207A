@@ -19,7 +19,7 @@ from astropy.time import Time
 # ---------------------------------------------------------------
 # Module-level constants  (available to subprocesses on spawn)
 # ---------------------------------------------------------------
-trigger_tjd = Time("2026-02-07 05:40:16.947").jd - 2457000
+trigger_tjd = Time("2026-02-07 05:42:33.65").jd - 2457000
 master_obs  = Time("2026-02-07 05:46:04.3")
 t_master    = master_obs.jd - 2457000 - trigger_tjd
 F_master    = 3276.0 * 10**(-0.4 * 17.3)
@@ -27,7 +27,6 @@ eF_master   = F_master * 0.30
 
 CADENCE    = 200 / 86400
 HALF_C     = CADENCE / 2
-S_AB       = 0.1
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
@@ -81,20 +80,31 @@ def windowed_eval(model_fn, t_arr, params):
     return out
 
 # ===============================================================
-# Forward-shock model — SBPL + TESS-bg constant, S=0.1
+# Forward-shock model — Granot & Sari nu_m crossing + TESS-bg constant
 # theta: [logF0, logTb, p, logC_bg]
 # ===============================================================
-FS_RISE_ALPHA = -0.5
-
 def decay_alpha_from_p(p):
     return 3.0 * (p - 1.0) / 4.0
 
-def model_FS(t, F0, tb, p, C_bg):
+def granot_sari_s(p):
+    return 1.84 - 0.40 * p
+
+def forward_shock_source_flux(t, F_b, tb, p):
+    """Source-only FS flux for nu_m crossing the band; F_b is flux at t=tb."""
+    t = np.asarray(t, dtype=float)
     pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
-    a2  = decay_alpha_from_p(p)
-    fs  = np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, S_AB), 0.0)
-    return fs + C_bg
+    ts = np.where(pos, t, 1e-10)
+    if not (F_b > 0.0 and tb > 0.0 and p > 2.0):
+        return np.full_like(t, np.nan)
+    x = ts / tb
+    s = granot_sari_s(p)
+    term_rise = x**(-0.5 * s)
+    term_decay = x**(0.75 * s * (p - 1.0))
+    fs = F_b * ((term_rise + term_decay) / 2.0)**(-1.0 / s)
+    return np.where(pos, fs, 0.0)
+
+def model_FS(t, F_b, tb, p, C_bg):
+    return forward_shock_source_flux(t, F_b, tb, p) + C_bg
 
 PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
@@ -124,14 +134,13 @@ def log_prob_FS(theta, x, y, yerr):
 
 def get_components_FS(t, p):
     # p: F0, tb, electron-index p, C_bg
-    pos = t > 0
-    ts  = np.where(pos, t, 1e-10)
     a2  = decay_alpha_from_p(p[2])
-    fs  = np.where(pos, sbpl(ts, p[0], p[1], FS_RISE_ALPHA, a2, S_AB), 0.0)
+    fs  = forward_shock_source_flux(t, p[0], p[1], p[2])
     cbg = np.full_like(t, p[3])
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  p={p[2]:.2f}"),
+         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  "
+         f"p={p[2]:.2f}  s={granot_sari_s(p[2]):.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={p[3]*1e6:.2f} µJy"),
     ]
@@ -273,10 +282,7 @@ def theta0_combined_from_fits(theta_FS_best, p_shift, t0_D):
 
 def get_components_combined(t, p):
     F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D, C_bg = p
-    pos_fs = t > 0
-    ts = np.where(pos_fs, t, 1e-10)
-    fs = np.where(pos_fs, sbpl(ts, F0_FS, tb_FS, FS_RISE_ALPHA,
-                               decay_alpha_from_p(p_FS), S_AB), 0.0)
+    fs = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
     tau = t - t0_D
     pos_d = tau > 0
     tau_eval = np.where(pos_d, tau, 1e-10)
@@ -285,7 +291,8 @@ def get_components_combined(t, p):
     cbg = np.full_like(t, C_bg)
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={tb_FS*1440:.1f} min  rise=+0.50  decay=-{decay_alpha_from_p(p_FS):.2f}"),
+         f"tb={tb_FS*1440:.1f} min  rise=+0.50  "
+         f"decay=-{decay_alpha_from_p(p_FS):.2f}  s={granot_sari_s(p_FS):.2f}"),
         ('Second peak (combined)', ds, '--', 'darkorange',
          f"t0={t0_D:.4f} d  tau_b=({tau_b1_D:.3f},{tau_b2_D:.3f}) d  alpha=({a1_D:.2f},{a2_D:.2f},{a3_D:.2f})"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
@@ -401,7 +408,7 @@ _CORNER_CFG = {
     'FS': dict(
         names=NAMES_FS,
         scale=[1e6, 1440, 1, 1e6],
-        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
+        labels=[r'$F_b\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
                 r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
     ),
     'SHIFT': dict(
@@ -414,7 +421,7 @@ _CORNER_CFG = {
     'COMBINED': dict(
         names=NAMES_COMBINED,
         scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
-        labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
+        labels=[r'$F_{b,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
                 r'$p$', r'$F_{0,\rm D}\ (\mu\mathrm{Jy})$',
                 r'$t_{0,\rm D}\ (\mathrm{d})$',
                 r'$\tau_{b,1,\rm D}\ (\mathrm{d})$', r'$\tau_{b,2,\rm D}\ (\mathrm{d})$',
@@ -433,16 +440,22 @@ def save_corner(tag, flat_chain):
     samp = flat_chain.copy()
     for j, (name, sc) in enumerate(zip(cfg['names'], cfg['scale'])):
         samp[:, j] = 10**samp[:, j] * sc if name.startswith('log') else samp[:, j] * sc
+    corner_kwargs = dict(
+        labels=cfg['labels'],
+        quantiles=[0.16, 0.5, 0.84],
+        show_titles=True,
+        title_fmt='.2f',
+        label_kwargs={'fontsize': 15, 'labelpad': 0.16},
+        title_kwargs={'fontsize': 13},
+    )
     try:
         with plt.rc_context({'text.usetex': True}):
-            fig_c = corner.corner(samp, labels=cfg['labels'],
-                                  quantiles=[0.16, 0.5, 0.84], show_titles=True,
-                                  title_fmt='.2f', label_kwargs={'fontsize': 9})
+            fig_c = corner.corner(samp, **corner_kwargs)
     except Exception:
-        fig_c = corner.corner(samp, labels=cfg['labels'],
-                              quantiles=[0.16, 0.5, 0.84], show_titles=True,
-                              title_fmt='.2f', label_kwargs={'fontsize': 9})
-    fig_c.savefig(f'GRB260207A_corner_{tag}.png', dpi=110, bbox_inches='tight')
+        fig_c = corner.corner(samp, **corner_kwargs)
+    for ax in fig_c.axes:
+        ax.tick_params(axis='both', labelsize=11)
+    fig_c.savefig(f'GRB260207A_corner_{tag}.png', dpi=160, bbox_inches='tight')
     plt.close(fig_c)
     print(f"Saved: GRB260207A_corner_{tag}.png")
 
@@ -956,7 +969,7 @@ if __name__ == '__main__':
     decay_best = decay_alpha_from_p(pFS[2])
 
     print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
-                 ['F0 (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
+                 ['F_b (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
                  [1e6, 1440, 1, 1e6],
                  chi2_rFS)
     print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
@@ -995,7 +1008,7 @@ if __name__ == '__main__':
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
+    ax.set_title('Forward shock only: Granot-Sari nu_m crossing', fontsize=10)
     ax.legend(fontsize=6.5, loc='lower left')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
@@ -1084,7 +1097,7 @@ if __name__ == '__main__':
     chi2_combined = -2*np.max(lpCombined)
     chi2_rCombined = chi2_combined / (len(xC) - len(NAMES_COMBINED))
     print_params('COMBINED FS + DSBPL MODEL', thetaCombined, NAMES_COMBINED, qCombined,
-                 ['F0_FS (uJy)', 'tb_FS (min)', 'p',
+                 ['F_b,FS (uJy)', 'tb_FS (min)', 'p',
                   'F0_D (uJy)', 't0_D (d)', 'tau_b1_D (d)', 'tau_b2_D (d)',
                   'a1_D', 'a2_D', 'a3_D', 'C_bg (uJy)'],
                  [1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
