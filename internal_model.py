@@ -1,13 +1,12 @@
-"""
-GRB260207A — emcee fit of a single forward-shock model.
+"""GRB260207A — emcee fit of a forward shock plus internal flare.
 
-Fit range: t in [-1.0, 0.02 d], unbinned.
-  Forward shock: smoothly broken power law, active for t > 0.
-  Rise is fixed to t**0.5.
-  Decay is fixed by p as t**[-3(p-1)/4], with 2.1 <= p <= 2.5.
+The early forward shock is fit first.  Its posterior-median electron index,
+rise slope, and smoothness are then fixed in a full trigger-frame fit:
 
-TESS background: constant C_bg = 10^logC_bg (Jy), evaluated everywhere.
-The plotted model is extrapolated across the current full plot range.
+    F_model(t) = F_FS(t) + F_flare(t) + C_bg
+
+The flare has a logistic turn-on/plateau and a curvature tail.  The curvature
+relation uses beta=1 and t0=t_rise, so its fixed exponent is -3.
 """
 
 import numpy as np
@@ -31,22 +30,17 @@ S_AB       = 0.02
 HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
-SHIFT_FIT_MAX = 0.08         # days after computed shifted origin for DSBPL fit
-SHIFT_PLOT_MAX = 1.0         # days after computed shifted origin for DSBPL plot
-COMBINED_FIT_MAX = 6.5       # days post-burst for combined FS+DSBPL fit
+INTERNAL_FIT_MAX = 6.5       # days post-burst for FS+flare fit
 PREBURST_MIN = -1.0          # one day before trigger
 PREBURST_MAX = 0.0           # trigger
+INTERNAL_MODEL_VERSION = 2
+BETA_INTERNAL = 1.0
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
 # ---------------------------------------------------------------
 def sbpl(t, F0, tb, a1, a2, S):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
-
-def dsbpl(t, F0, tb1, tb2, a1, a2, a3, S):
-    f1 = (0.5*(1 + (t/tb1)**(1/S)))**(-(a2-a1)*S)
-    f2 = (0.5*(1 + (t/tb2)**(1/S)))**(-(a3-a2)*S)
-    return F0 * (t/tb1)**(-a1) * f1 * f2
 
 def windowed_eval(model_fn, t_arr, params):
     """Integrate near-trigger (t < 5 min) points over 200-s cadence window.
@@ -128,30 +122,37 @@ def estimate_additive_jitter(flux, flux_err):
     return 0.5 * (lower + upper)
 
 # ===============================================================
-# Forward-shock model — SBPL + TESS-bg constant, S=0.02
-# theta: [logF0, logTb, p, logC_bg]
+# Forward-shock model — SBPL + TESS-bg constant
+# theta: [logF0, logTb, logC_bg, logS_FS, p, alpha_rise_FS]
 # ===============================================================
-FS_RISE_ALPHA = -0.5
+ALPHA_RISE_INITIAL = 0.5
+ALPHA_RISE_INTERNAL = ALPHA_RISE_INITIAL
+P_INITIAL = 2.3
+P_INTERNAL = P_INITIAL
 
 def decay_alpha_from_p(p):
     return 3.0 * (p - 1.0) / 4.0
 
-def forward_shock_source_flux(t, F0, tb, p):
+def forward_shock_source_flux(t, F0, tb, p, S=None, alpha_rise=None):
     """Source-only forward-shock flux; zero before the trigger."""
     t = np.asarray(t, dtype=float)
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
     a2 = decay_alpha_from_p(p)
-    return np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, S_AB), 0.0)
+    smooth = S_AB if S is None else S
+    rise = ALPHA_RISE_INTERNAL if alpha_rise is None else alpha_rise
+    return np.where(pos, sbpl(ts, F0, tb, -rise, a2, smooth), 0.0)
 
-def model_FS(t, F0, tb, p, C_bg):
-    return forward_shock_source_flux(t, F0, tb, p) + C_bg
+def model_FS(t, F0, tb, C_bg, S_FS, p, alpha_rise_FS):
+    return forward_shock_source_flux(t, F0, tb, p, S_FS, alpha_rise_FS) + C_bg
 
 PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
     'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
-    'p':       ( 2.1,  2.5),
     'logC_bg': (-10.0, -4.0),
+    'logS_FS': (np.log10(0.005), np.log10(0.5)),
+    'p':       (1.5, 3.0),
+    'alpha_rise_FS': (0.0, 2.0),
 }
 NAMES_FS = list(PRIOR_FS.keys())
 
@@ -161,8 +162,9 @@ def log_prior_FS(theta):
     return 0.0
 
 def theta_to_params_FS(theta):
-    logF0, logTb, p, logC_bg = theta
-    return (10**logF0, 10**logTb, p, 10**logC_bg)
+    logF0, logTb, logC_bg, logS_FS, p, alpha_rise_FS = theta
+    return (10**logF0, 10**logTb, 10**logC_bg, 10**logS_FS,
+            p, alpha_rise_FS)
 
 def log_prob_FS(theta, x, y, yerr):
     lp = log_prior_FS(theta)
@@ -174,167 +176,137 @@ def log_prob_FS(theta, x, y, yerr):
     return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
 def get_components_FS(t, p):
-    # p: F0, tb, electron-index p, C_bg
-    a2  = decay_alpha_from_p(p[2])
-    fs  = forward_shock_source_flux(t, p[0], p[1], p[2])
-    cbg = np.full_like(t, p[3])
+    a2  = decay_alpha_from_p(p[4])
+    fs  = forward_shock_source_flux(t, p[0], p[1], p[4], p[3], p[5])
+    cbg = np.full_like(t, p[2])
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={p[1]*1440:.1f} min  rise=+0.50  decay=-{a2:.2f}  p={p[2]:.2f}"),
+         f"tb={p[1]*1440:.1f} min  S={p[3]:.3f}  "
+         f"rise=+{p[5]:.2f}  decay=-{a2:.2f}  p={p[4]:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
-         f"C_bg={p[3]*1e6:.2f} µJy"),
+         f"C_bg={p[2]*1e6:.2f} µJy"),
     ]
 
-theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), 2.25, -4.5])
+theta0_FS = np.array([
+    np.log10(7e-4), np.log10(10/1440), -4.5, np.log10(S_AB),
+    P_INITIAL, ALPHA_RISE_INITIAL,
+])
+
+def fs_smoothness_posterior_median(flat_chain):
+    return float(np.median(10**np.asarray(flat_chain)[:, NAMES_FS.index('logS_FS')]))
+
+def fs_rise_posterior_median(flat_chain):
+    return float(np.median(np.asarray(flat_chain)[:, NAMES_FS.index('alpha_rise_FS')]))
+
+def fs_p_posterior_median(flat_chain):
+    return float(np.median(np.asarray(flat_chain)[:, NAMES_FS.index('p')]))
 
 # ===============================================================
-# Shifted excess model — DSBPL only
-# The forward-shock subtraction already removes the fitted C_bg, so adding a
-# second constant here double-counts the background.
-# theta: [logF0, logTb1, logTb2, a1, a2, a3]
+# Internal model — unchanged FS plus piecewise flare and TESS background
 # ===============================================================
-S_SHIFT = 0.02
-
-def model_shifted_excess(t, F0, tb1, tb2, a1, a2, a3):
-    pos = t > 0
-    ts = np.where(pos, t, 1e-10)
-    comp = np.where(pos, dsbpl(ts, F0, tb1, tb2, a1, a2, a3, S_SHIFT), 0.0)
-    return comp
-
-PRIOR_SHIFT = {
-    'logF0':   (-6.5, -2.5),
-    'logTb1':  (np.log10(0.01), np.log10(0.02)),
-    'logTb2':  (np.log10(0.02), np.log10(0.05)),
-    'a1':      (-8.0,  0.0),
-    'a2':      (-2.0,  5.0),
-    'a3':      ( 0.2, 12.0),
-}
-NAMES_SHIFT = list(PRIOR_SHIFT.keys())
-
-def log_prior_shift(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_SHIFT.values()):
-        if not (lo <= v <= hi): return -np.inf
-    if theta[2] <= theta[1]: return -np.inf
-    return 0.0
-
-def theta_to_params_shift(theta):
-    logF0, logTb1, logTb2, a1, a2, a3 = theta
-    return (10**logF0, 10**logTb1, 10**logTb2, a1, a2, a3)
-
-def log_prob_shift(theta, x, y, yerr):
-    lp = log_prior_shift(theta)
-    if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_shift(theta)
-    ymod = model_shifted_excess(x, *params)
-    if not np.all(np.isfinite(ymod)): return -np.inf
-    return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
-
-def get_components_shift(t, p):
-    pos = t > 0
-    ts = np.where(pos, t, 1e-10)
-    comp = np.where(pos, dsbpl(ts, p[0], p[1], p[2], p[3], p[4], p[5], S_SHIFT), 0.0)
-    return [
-        ('DSBPL excess', comp, '--', 'darkorange',
-         f"tb=({p[1]:.3f},{p[2]:.3f}) d  alpha=({p[3]:.2f},{p[4]:.2f},{p[5]:.2f})"),
-    ]
-
-theta0_SHIFT = np.array([np.log10(3e-4), np.log10(0.015), np.log10(0.035),
-                         -3.0, 1.0, 3.0])
-
-# ===============================================================
-# Combined trigger-frame model — FS SBPL + DSBPL(t - t0_D) + C_bg
-# theta: [logF0_FS, logTb_FS, p, logF0_D, t0_D, logTauB1_D,
-#         logTauB2_D, a1_D, a2_D, a3_D, logC_bg]
-# ===============================================================
-COMBINED_T0_HALF_WIDTH = 0.02
-PRIOR_COMBINED = {
+NAMES_INTERNAL = [
+    'logF0_FS', 'logTb_FS', 'logC_bg', 't_rise', 'tau_rise', 't_off',
+    'logF_peak',
+]
+PRIOR_INTERNAL = {
     'logF0_FS':  (-6.0, -2.3),
     'logTb_FS':  (-2.523, -1.699),
-    'p':         ( 2.1,  2.5),
-    'logF0_D':   (-8.0, -2.0),
-    't0_D':      ( 0.0,  0.08),
-    'logTauB1_D': (np.log10(0.003), np.log10(0.08)),
-    'logTauB2_D': (np.log10(0.006), np.log10(0.20)),
-    'a1_D':      (-8.0,  0.0),
-    'a2_D':      (-2.0,  5.0),
-    'a3_D':      ( 0.2, 12.0),
     'logC_bg':   (-10.0, -4.0),
+    't_rise':    (0.012, 0.050),
+    'tau_rise':  (0.0, 0.020),
+    't_off':     (0.035, 0.080),
+    'logF_peak': (-8.0, -2.0),
 }
-NAMES_COMBINED = list(PRIOR_COMBINED.keys())
 
-def set_combined_t0_prior(t0_center):
-    lo = max(0.0, float(t0_center) - COMBINED_T0_HALF_WIDTH)
-    hi = float(t0_center) + COMBINED_T0_HALF_WIDTH
-    PRIOR_COMBINED['t0_D'] = (lo, hi)
+def internal_flare_flux(t, F_peak, t_rise, tau_rise, t_off,
+                        beta=BETA_INTERNAL):
+    """Logistic turn-on followed by a curvature tail with t0=t_rise.
 
-def model_combined(t, F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D,
-                   a1_D, a2_D, a3_D, C_bg):
-    fs = model_FS(t, F0_FS, tb_FS, p_FS, C_bg)
-    tau = t - t0_D
-    pos = tau > 0
-    tau_eval = np.where(pos, tau, 1e-10)
-    ds = np.where(pos, dsbpl(tau_eval, F0_D, tau_b1_D, tau_b2_D,
-                             a1_D, a2_D, a3_D, S_SHIFT), 0.0)
-    return fs + ds
+    The logistic is normalized at ``t_off`` so the two branches meet exactly
+    at ``F_peak``.  ``tau_rise=0`` is the sharp, unresolved-rise limit.
+    """
+    t = np.asarray(t, dtype=float)
+    if not (0.0 < t_rise < t_off):
+        raise ValueError("Require 0 < t_rise < t_off")
+    if F_peak <= 0.0 or tau_rise < 0.0 or beta <= -2.0:
+        raise ValueError("Invalid flare amplitude or slope")
+    active_rise = (t > 0.0) & (t <= t_off)
+    tail = t > t_off
+    flare = np.zeros_like(t)
+    if tau_rise == 0.0:
+        flare[active_rise] = np.where(
+            t[active_rise] < t_rise, 0.0, F_peak)
+    else:
+        def logistic(z):
+            out = np.empty_like(z, dtype=float)
+            nonnegative = z >= 0.0
+            out[nonnegative] = 1.0 / (1.0 + np.exp(-z[nonnegative]))
+            exp_z = np.exp(z[~nonnegative])
+            out[~nonnegative] = exp_z / (1.0 + exp_z)
+            return out
 
-def log_prior_combined(theta):
-    for v, (lo, hi) in zip(theta, PRIOR_COMBINED.values()):
-        if not (lo <= v <= hi): return -np.inf
-    if theta[6] <= theta[5]: return -np.inf
+        scale_off = logistic(np.array([(t_off - t_rise) / tau_rise]))[0]
+        flare[active_rise] = F_peak * logistic(
+            (t[active_rise] - t_rise) / tau_rise) / scale_off
+    flare[tail] = F_peak * ((t[tail] - t_rise) /
+                            (t_off - t_rise))**(-(2.0 + beta))
+    return flare
+
+def model_internal(t, F0_FS, tb_FS, C_bg, t_rise, tau_rise, t_off,
+                   F_peak):
+    fs = forward_shock_source_flux(t, F0_FS, tb_FS, P_INTERNAL)
+    flare = internal_flare_flux(
+        t, F_peak, t_rise, tau_rise, t_off)
+    return fs + flare + C_bg
+
+def log_prior_internal(theta):
+    for value, (lo, hi) in zip(theta, PRIOR_INTERNAL.values()):
+        if not (lo <= value <= hi):
+            return -np.inf
+    _, logTb_FS, _, t_rise, _, t_off, _ = theta
+    if not (10**logTb_FS < t_rise < t_off < 0.10):
+        return -np.inf
     return 0.0
 
-def theta_to_params_combined(theta):
-    (logF0_FS, logTb_FS, p_FS, logF0_D, t0_D, logTauB1_D,
-     logTauB2_D, a1_D, a2_D, a3_D, logC_bg) = theta
-    return (10**logF0_FS, 10**logTb_FS, p_FS,
-            10**logF0_D, t0_D, 10**logTauB1_D, 10**logTauB2_D,
-            a1_D, a2_D, a3_D, 10**logC_bg)
+def theta_to_params_internal(theta):
+    (logF0_FS, logTb_FS, logC_bg, t_rise, tau_rise, t_off,
+     logF_peak) = theta
+    return (10**logF0_FS, 10**logTb_FS, 10**logC_bg,
+            t_rise, tau_rise, t_off, 10**logF_peak)
 
-def log_prob_combined(theta, x, y, yerr):
-    lp = log_prior_combined(theta)
-    if not np.isfinite(lp): return -np.inf
-    params = theta_to_params_combined(theta)
-    try:    ymod = windowed_eval(model_combined, x, params)
-    except: return -np.inf
-    if not np.all(np.isfinite(ymod)): return -np.inf
+def log_prob_internal(theta, x, y, yerr):
+    lp = log_prior_internal(theta)
+    if not np.isfinite(lp):
+        return -np.inf
+    try:
+        ymod = windowed_eval(model_internal, x, theta_to_params_internal(theta))
+    except Exception:
+        return -np.inf
+    if not np.all(np.isfinite(ymod)):
+        return -np.inf
     return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
-def theta0_combined_from_fits(theta_FS_best, p_shift, t0_D):
-    F0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D = p_shift
+def theta0_internal_from_fs(theta_FS_best):
     theta0 = np.array([
-        theta_FS_best[0],
-        theta_FS_best[1],
-        theta_FS_best[2],
-        np.log10(F0_D),
-        t0_D,
-        np.log10(tau_b1_D),
-        np.log10(tau_b2_D),
-        a1_D,
-        a2_D,
-        a3_D,
-        theta_FS_best[3],
+        theta_FS_best[0], theta_FS_best[1], theta_FS_best[2],
+        0.030, 0.002, 0.046, np.log10(3.5e-4),
     ])
-    for j, (lo, hi) in enumerate(PRIOR_COMBINED.values()):
+    for j, (lo, hi) in enumerate(PRIOR_INTERNAL.values()):
         theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
-    if theta0[6] <= theta0[5]:
-        theta0[6] = min(PRIOR_COMBINED['logTauB2_D'][1] - 1e-4, theta0[5] + 1e-3)
     return theta0
 
-def get_components_combined(t, p):
-    F0_FS, tb_FS, p_FS, F0_D, t0_D, tau_b1_D, tau_b2_D, a1_D, a2_D, a3_D, C_bg = p
-    fs = forward_shock_source_flux(t, F0_FS, tb_FS, p_FS)
-    tau = t - t0_D
-    pos_d = tau > 0
-    tau_eval = np.where(pos_d, tau, 1e-10)
-    ds = np.where(pos_d, dsbpl(tau_eval, F0_D, tau_b1_D, tau_b2_D,
-                             a1_D, a2_D, a3_D, S_SHIFT), 0.0)
+def get_components_internal(t, p):
+    (F0_FS, tb_FS, C_bg, t_rise, tau_rise, t_off, F_peak) = p
+    fs = forward_shock_source_flux(t, F0_FS, tb_FS, P_INTERNAL)
+    flare = internal_flare_flux(t, F_peak, t_rise, tau_rise, t_off)
     cbg = np.full_like(t, C_bg)
     return [
         ('Forward shock', fs, '--', 'goldenrod',
-         f"tb={tb_FS*1440:.1f} min  rise=+0.50  "
-         f"decay=-{decay_alpha_from_p(p_FS):.2f}"),
-        ('Second peak (combined)', ds, '--', 'darkorange',
-         f"t0={t0_D:.4f} d  tau_b=({tau_b1_D:.3f},{tau_b2_D:.3f}) d  alpha=({a1_D:.2f},{a2_D:.2f},{a3_D:.2f})"),
+         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_INTERNAL):.2f}  "
+         f"p={P_INTERNAL:.2f}"),
+        ('Internal flare', flare, ':', 'crimson',
+         f"F_p={F_peak*1e6:.2f} uJy  tau_r={tau_rise*1440:.2f} min  "
+         f"tail=-{2+BETA_INTERNAL:.1f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={C_bg*1e6:.2f} uJy"),
     ]
@@ -403,15 +375,10 @@ def _fit_FS(xD, yD, yeD, quick=False):
     return run_emcee(xD, yD, yeD, theta0_FS, PRIOR_FS, log_prob_FS,
                      'Forward shock', quick=quick)
 
-def _fit_shift(xD, yD, yeD, quick=False):
-    np.random.seed(46)
-    return run_emcee(xD, yD, yeD, theta0_SHIFT, PRIOR_SHIFT, log_prob_shift,
-                     'Shifted excess DSBPL', quick=quick)
-
-def _fit_combined(xD, yD, yeD, theta0_combined, quick=False):
+def _fit_internal(xD, yD, yeD, theta0_internal, quick=False):
     np.random.seed(52)
-    return run_emcee(xD, yD, yeD, theta0_combined, PRIOR_COMBINED,
-                     log_prob_combined, 'Combined FS+DSBPL', quick=quick)
+    return run_emcee(xD, yD, yeD, theta0_internal, PRIOR_INTERNAL,
+                     log_prob_internal, 'FS + internal flare', quick=quick)
 
 # ---------------------------------------------------------------
 # Summarize flat chains
@@ -447,26 +414,18 @@ def print_params(title, theta_best, param_names, quantiles,
 _CORNER_CFG = {
     'FS': dict(
         names=NAMES_FS,
-        scale=[1e6, 1440, 1, 1e6],
+        scale=[1e6, 1440, 1e6, 1, 1, 1],
         labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
-                r'$p$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$S_{\rm FS}$', r'$p$',
+                r'$\alpha_{\rm FS,rise}$'],
     ),
-    'SHIFT': dict(
-        names=NAMES_SHIFT,
-        scale=[1e6, 1, 1, 1, 1, 1],
-        labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_{b,1}\ (\mathrm{d})$',
-                r'$t_{b,2}\ (\mathrm{d})$', r'$\alpha_1$', r'$\alpha_2$',
-                r'$\alpha_3$'],
-    ),
-    'COMBINED': dict(
-        names=NAMES_COMBINED,
-        scale=[1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
+    'INTERNAL': dict(
+        names=NAMES_INTERNAL,
+        scale=[1e6, 1440, 1e6, 1, 1440, 1, 1e6],
         labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
-                r'$p$', r'$F_{0,\rm D}\ (\mu\mathrm{Jy})$',
-                r'$t_{0,\rm D}\ (\mathrm{d})$',
-                r'$\tau_{b,1,\rm D}\ (\mathrm{d})$', r'$\tau_{b,2,\rm D}\ (\mathrm{d})$',
-                r'$\alpha_{1,\rm D}$', r'$\alpha_{2,\rm D}$',
-                r'$\alpha_{3,\rm D}$', r'$C_{\rm bg}\ (\mu\mathrm{Jy})$'],
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$t_r\ (\mathrm{d})$',
+                r'$\tau_r\ (\mathrm{min})$', r'$t_{\rm off}\ (\mathrm{d})$',
+                r'$F_p\ (\mu\mathrm{Jy})$'],
     ),
 }
 
@@ -505,7 +464,7 @@ def save_corner(tag, flat_chain):
 # Plotting helpers  (reference x_plot/y_plot/ye_plot as module globals
 #                    set inside __main__ before these are ever called)
 # ---------------------------------------------------------------
-MODEL_COLOR = {'FS': 'royalblue', 'COMBINED': 'navy'}
+MODEL_COLOR = {'FS': 'royalblue', 'INTERNAL': 'navy'}
 
 def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
     pos          = y_plot > 0
@@ -611,206 +570,52 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
     ax_res.legend(fontsize=7, loc='upper right')
     ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
 
-def compute_effective_t90(x, excess, t_min, t_max):
-    """Return T05 offset, effective T90, and T95 for positive excess fluence."""
-    sel = (x >= t_min) & (x <= t_max) & np.isfinite(excess) & (excess > 0)
-    tx = x[sel]
-    fx = excess[sel]
-    if len(tx) < 2:
-        return t_min, 0.0, t_min
-
-    order = np.argsort(tx)
-    tx = tx[order]
-    fx = fx[order]
-    edges = np.empty(len(tx) + 1)
-    edges[1:-1] = 0.5 * (tx[:-1] + tx[1:])
-    edges[0] = max(t_min, tx[0] - 0.5 * (tx[1] - tx[0]))
-    edges[-1] = min(t_max, tx[-1] + 0.5 * (tx[-1] - tx[-2]))
-    dt = np.maximum(np.diff(edges), 0.0)
-    cumulative = np.cumsum(fx * dt)
-    total = cumulative[-1]
-    if not np.isfinite(total) or total <= 0:
-        return t_min, 0.0, t_min
-
-    t05 = np.interp(0.05 * total, cumulative, tx)
-    t95 = np.interp(0.95 * total, cumulative, tx)
-    return t05, t95 - t05, t95
-
-def save_shifted_excess_plot(model_fn, params_best, tburst_offset, t90_eff):
-    """Plot positive Data - Model excess versus computed shifted time."""
-    t_shift = x_plot - tburst_offset
-    in_win  = (t_shift > 0) & (t_shift <= SHIFT_PLOT_MAX)
-    ymod    = model_fn(x_plot[in_win], *params_best)
-    excess  = y_plot[in_win] - ymod
-    e_excess = ye_plot[in_win]
-    x_excess = t_shift[in_win]
-
-    pos = excess > 0
-    n_omit = int((~pos).sum())
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    if pos.any():
-        ax.errorbar(x_excess[pos], excess[pos], yerr=e_excess[pos],
-                    fmt='.', color='black', markersize=3, elinewidth=0.4,
-                    alpha=0.8, capsize=0, label='Data - model')
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_xlim(max(x_excess[pos].min() * 0.8, 1e-5) if pos.any() else 1e-5, 1.0)
-    if pos.any():
-        ax.set_ylim(max(e_excess[pos].min() * 0.3, excess[pos].min() * 0.5),
-                    excess[pos].max() * 2.0)
-    ax.set_xlabel(f'Days after T$_0$ + {tburst_offset:.5f} d', fontsize=11)
-    ax.set_ylabel('Data - Model (Jy)', fontsize=11)
-    ax.grid(True, which='both', alpha=0.2, lw=0.5)
-    ax.legend(fontsize=8, loc='best')
-    ax.set_title(f'Positive excess after forward-shock subtraction  '
-                 f'(T90={t90_eff:.3f} d; {n_omit} non-positive points omitted)', fontsize=10)
-    plt.suptitle('GRB 260207A', fontsize=14, y=0.98)
-    plt.tight_layout()
-    plt.savefig('GRB260207A_shifted_excess.png', dpi=130, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: GRB260207A_shifted_excess.png  "
-          f"(positive points={int(pos.sum())}, omitted non-positive={n_omit})")
-
-def save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot,
-                            fit_mask_plot, chain, lp, chi2_r,
-                            tburst_offset, t90_eff):
-    p_best = theta_to_params_shift(chain[np.argmax(lp)])
-    t_model = np.logspace(np.log10(max(x_shift_plot[x_shift_plot > 0].min() * 0.8, 1e-5)),
-                          np.log10(SHIFT_PLOT_MAX), 1200)
-
-    fig, (ax, ax_res) = plt.subplots(
-        2, 1, figsize=(8, 9),
-        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
-
-    pos_data = y_shift_plot > 0
-    fit_pos = fit_mask_plot & pos_data
-    excl_pos = ~fit_mask_plot & pos_data
-    fit_nonpos = fit_mask_plot & ~pos_data
-    excl_nonpos = ~fit_mask_plot & ~pos_data
-    if excl_pos.any():
-        ax.errorbar(x_shift_plot[excl_pos], y_shift_plot[excl_pos],
-                    yerr=ye_shift_plot[excl_pos], fmt='.', color='gray',
-                    markersize=2, elinewidth=0.3, alpha=0.45, capsize=0,
-                    label='Excluded')
-    if fit_pos.any():
-        ax.errorbar(x_shift_plot[fit_pos], y_shift_plot[fit_pos],
-                    yerr=ye_shift_plot[fit_pos], fmt='.', color='black',
-                    markersize=3, elinewidth=0.4, alpha=0.8, capsize=0,
-                    label='Fitted')
-    if (fit_nonpos | excl_nonpos).any():
-        nonpos_x = np.concatenate([x_shift_plot[excl_nonpos], x_shift_plot[fit_nonpos]])
-        nonpos_y = np.concatenate([np.abs(y_shift_plot[excl_nonpos]),
-                                   np.abs(y_shift_plot[fit_nonpos])])
-        nonpos_ye = np.concatenate([ye_shift_plot[excl_nonpos],
-                                    ye_shift_plot[fit_nonpos]])
-        if len(nonpos_x):
-            ax.errorbar(nonpos_x, nonpos_y, yerr=nonpos_ye, fmt='.',
-                        color='lightgray', markersize=2, elinewidth=0.3,
-                        alpha=0.35, capsize=0, label='Non-positive residuals (abs)')
-    ax.axvline(SHIFT_FIT_MAX, color='gray', ls='--', lw=0.9, alpha=0.6,
-               label=f'Fit limit: {SHIFT_FIT_MAX:.2f} d')
-
-    rng = np.random.default_rng(46)
-    for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
-        y_samp = model_shifted_excess(t_model, *theta_to_params_shift(chain[i]))
-        ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
-                '-', color='darkorange', lw=0.3, alpha=0.04, zorder=4)
-
-    y_best = model_shifted_excess(t_model, *p_best)
-    ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
-            '-', color='darkorange', lw=2.0, zorder=6,
-            label=f'Best fit  chi2_r={chi2_r:.2f}')
-    for (clabel, cy, ls, ccolor, desc) in get_components_shift(t_model, p_best):
-        ax.plot(t_model, np.where(cy > 0, cy, np.nan),
-                color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
-
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_xlim(t_model.min(), SHIFT_PLOT_MAX)
-    vis = pos_data & np.isfinite(y_shift_plot)
-    if vis.any():
-        ax.set_ylim(max(ye_shift_plot[vis].min() * 0.3, y_shift_plot[vis].min() * 0.5),
-                    y_shift_plot[vis].max() * 2.0)
-    ax.set_ylabel('Data - Forward Shock (Jy)', fontsize=11)
-    ax.set_title(f'Shifted excess: DSBPL only  '
-                 f'(T90={t90_eff:.3f} d)', fontsize=10)
-    ax.legend(fontsize=6.5, loc='best')
-    ax.grid(True, which='both', alpha=0.2, lw=0.5)
-    ax.tick_params(labelbottom=False)
-
-    ymod_data = model_shifted_excess(x_shift_plot, *p_best)
-    resid = (y_shift_plot - ymod_data) / ye_shift_plot
-    ax_res.axhline(0, color='darkorange', lw=1.2, zorder=5)
-    ax_res.axhline( 3, color='gray', lw=0.8, ls='--', alpha=0.5)
-    ax_res.axhline(-3, color='gray', lw=0.8, ls='--', alpha=0.5)
-    ax_res.errorbar(x_shift_plot[~fit_mask_plot], resid[~fit_mask_plot],
-                    yerr=np.ones_like(resid[~fit_mask_plot]),
-                    fmt='.', color='gray', markersize=2, elinewidth=0.3,
-                    alpha=0.45, capsize=0)
-    ax_res.errorbar(x_shift_plot[fit_mask_plot], resid[fit_mask_plot],
-                    yerr=np.ones_like(resid[fit_mask_plot]),
-                    fmt='.', color='black', markersize=3, elinewidth=0.4,
-                    alpha=0.8, capsize=0)
-    ax_res.axvline(SHIFT_FIT_MAX, color='gray', ls='--', lw=0.9, alpha=0.6)
-    finite = np.abs(resid[np.isfinite(resid)])
-    ymax = max(7.0, min(30.0, 1.2 * np.percentile(finite, 99))) if len(finite) else 7.0
-    ax_res.set_xscale('log')
-    ax_res.set_xlim(t_model.min(), SHIFT_PLOT_MAX)
-    ax_res.set_ylim(-ymax, ymax)
-    ax_res.set_xlabel(f'Days after T$_0$ + {tburst_offset:.5f} d', fontsize=11)
-    ax_res.set_ylabel('Residuals (sigma)', fontsize=10)
-    ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
-
-    plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
-    plt.savefig('GRB260207A_shifted_excess_dsbpl.png', dpi=130, bbox_inches='tight')
-    plt.close()
-    print("Saved: GRB260207A_shifted_excess_dsbpl.png")
-
-def save_combined_plot(mask_combined_fit, chain, lp, chi2_r, tburst_offset):
-    p_best = theta_to_params_combined(chain[np.argmax(lp)])
+def save_internal_plot(mask_internal_fit, chain, lp, chi2_r):
+    p_best = theta_to_params_internal(chain[np.argmax(lp)])
     t_model = np.logspace(np.log10(2e-4), np.log10(13), 1500)
-    color = MODEL_COLOR['COMBINED']
+    color = MODEL_COLOR['INTERNAL']
 
     fig, (ax, ax_res) = plt.subplots(
         2, 1, figsize=(8, 9),
         gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
 
-    add_data_to_ax(ax, mask_combined_fit)
+    add_data_to_ax(ax, mask_internal_fit)
 
     rng = np.random.default_rng(52)
     for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
-        y_samp = model_combined(t_model, *theta_to_params_combined(chain[i]))
+        y_samp = model_internal(t_model, *theta_to_params_internal(chain[i]))
         ax.plot(t_model, np.where(y_samp > 0, y_samp, np.nan),
                 '-', color=color, lw=0.3, alpha=0.04, zorder=4)
 
-    y_best = model_combined(t_model, *p_best)
+    y_best = model_internal(t_model, *p_best)
     ax.plot(t_model, np.where(y_best > 0, y_best, np.nan),
             '-', color=color, lw=2.0, zorder=6,
             label=f'Best fit  chi2_r={chi2_r:.2f}')
-    for (clabel, cy, ls, ccolor, desc) in get_components_combined(t_model, p_best):
+    for (clabel, cy, ls, ccolor, desc) in get_components_internal(t_model, p_best):
         ax.plot(t_model, np.where(cy > 0, cy, np.nan),
                 color=ccolor, ls=ls, lw=1.4, zorder=5, label=f'{clabel}: {desc}')
 
-    ax.axvline(p_best[4], color='dimgray', ls=':', lw=1.1, alpha=0.9,
-               label=f'fitted t0_D={p_best[4]:.4f} d')
+    for tx, label in [(p_best[3], r'$t_r$'),
+                      (p_best[5], r'$t_{\rm off}$')]:
+        ax.axvline(tx, color='dimgray', ls=':', lw=0.9, alpha=0.75,
+                   label=f'{label}={tx:.4f} d')
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Combined original-frame model: FS SBPL + second-peak DSBPL', fontsize=10)
+    ax.set_title('Forward shock plus piecewise internal flare', fontsize=10)
     ax.legend(fontsize=6.2, loc='best')
     add_minutes_axis(ax)
-    plot_residuals(ax_res, mask_combined_fit, model_combined, p_best, color)
+    plot_residuals(ax_res, mask_internal_fit, model_internal, p_best, color)
 
     plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
-    plt.savefig('GRB260207A_emcee_combined.png', dpi=130, bbox_inches='tight')
+    plt.savefig('GRB260207A_emcee_internal_flare.png', dpi=130, bbox_inches='tight')
     plt.close()
-    print("Saved: GRB260207A_emcee_combined.png")
+    print("Saved: GRB260207A_emcee_internal_flare.png")
 
 def save_background_plot(bg_models):
     """Dedicated plot of the TESS background constant.
 
-    bg_models: list of (tag, chain, lp, theta_fn).
+    bg_models: list of (tag, chain, lp, theta_fn, c_bg_index).
     Uses module globals x_plot / y_plot / ye_plot (full mask_plot range).
     Shows linear x-axis so the pre-burst region and the full background
     level are visible. y-axis uses symlog so both the bright afterglow and
@@ -832,14 +637,14 @@ def save_background_plot(bg_models):
 
     # --- posterior samples + best-fit constant background --------
     rng = np.random.default_rng(0)
-    for tag, chain, lp, theta_fn in bg_models:
+    for tag, chain, lp, theta_fn, c_bg_index in bg_models:
         color = MODEL_COLOR.get(tag, MODEL_COLOR['FS'])
         idx   = rng.choice(len(chain), min(300, len(chain)), replace=False)
         for i in idx:
             p   = theta_fn(chain[i])
-            ax.axhline(p[-1], color=color, lw=0.3, alpha=0.04, zorder=3)
+            ax.axhline(p[c_bg_index], color=color, lw=0.3, alpha=0.04, zorder=3)
         p_best = theta_fn(chain[np.argmax(lp)])
-        C_bg   = p_best[-1]
+        C_bg   = p_best[c_bg_index]
         ax.axhline(C_bg, color=color, lw=2, zorder=5,
                    label=f'{tag}  C_bg={C_bg*1e6:.2f} µJy')
 
@@ -859,9 +664,9 @@ def save_background_plot(bg_models):
     ax.grid(True, which='both', alpha=0.2, lw=0.5)
     plt.suptitle('GRB 260207A — TESS Background (constant)', fontsize=13, y=1.01)
     plt.tight_layout()
-    plt.savefig('GRB260207A_tess_bg.png', dpi=130, bbox_inches='tight')
+    plt.savefig('GRB260207A_tess_bg_internal.png', dpi=130, bbox_inches='tight')
     plt.close()
-    print("Saved: GRB260207A_tess_bg.png")
+    print("Saved: GRB260207A_tess_bg_internal.png")
 
 
 # ===============================================================
@@ -1028,15 +833,25 @@ if __name__ == '__main__':
     npar = len(NAMES_FS)
     chi2_FS  = -2*np.max(lpFS)
     chi2_rFS = chi2_FS / (N - npar)
-    decay_best = decay_alpha_from_p(pFS[2])
+    decay_best = decay_alpha_from_p(pFS[4])
 
     print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
-                 ['F0 (uJy)', 'tb (min)', 'p', 'C_bg (uJy)'],
-                 [1e6, 1440, 1, 1e6],
+                 ['F0 (uJy)', 'tb (min)', 'C_bg (uJy)', 'S_FS', 'p',
+                  'alpha_rise_FS'],
+                 [1e6, 1440, 1e6, 1, 1, 1],
                  chi2_rFS)
-    print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
+    print(f"  {'rise slope':>24s}:    {pFS[5]: .3f}   (fitted)")
     print(f"  {'decay slope':>24s}:    {-decay_best: .3f}   "
           f"(fixed by best-fit p as -3(p-1)/4)")
+    ALPHA_RISE_INTERNAL = fs_rise_posterior_median(chainFS)
+    S_AB = fs_smoothness_posterior_median(chainFS)
+    P_INTERNAL = fs_p_posterior_median(chainFS)
+    print(f"  {'rise for internal':>24s}:     {ALPHA_RISE_INTERNAL:.3f}   "
+          "(fixed at FS posterior median)")
+    print(f"  {'S_FS for internal':>24s}:     {S_AB:.3f}   "
+          "(fixed at FS posterior median)")
+    print(f"  {'p for internal':>24s}:     {P_INTERNAL:.3f}   "
+          "(fixed at FS posterior median)")
 
     # -----------------------------------------------------------
     # Corner plot
@@ -1070,7 +885,8 @@ if __name__ == '__main__':
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
+    ax.set_title(f'Forward shock only: rise t$^{{{p_best[5]:.2f}}}$, '
+                 'decay t$^{-3(p-1)/4}$', fontsize=10)
     ax.legend(fontsize=6.5, loc='lower left')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
@@ -1080,101 +896,46 @@ if __name__ == '__main__':
     plt.close()
     print("Saved: GRB260207A_emcee_forward_shock.png")
 
-    # -----------------------------------------------------------
-    # Shifted positive-excess plot: Data - Model, with computed tburst offset
-    # -----------------------------------------------------------
-    fs_subtracted = y_plot - model_FS(x_plot, *p_best)
-    timing_max = FS_FIT_MAX + SHIFT_FIT_MAX
-    tburst_offset, t90_eff, t95_eff = compute_effective_t90(
-        x_plot, fs_subtracted, 0.0, timing_max)
-    print(f"\nEffective shifted-excess timing: "
-          f"tburst_offset=T05={tburst_offset:.5f} d, "
-          f"T90={t90_eff:.5f} d, T95={t95_eff:.5f} d "
-          f"(computed over t=[0,{timing_max:.3f}] d)")
-    save_shifted_excess_plot(model_FS, p_best, tburst_offset, t90_eff)
+    # Fit the full trigger-frame forward shock plus piecewise flare.
+    theta0_internal = theta0_internal_from_fs(thetaFS)
+    mask_internal_fit = ((x_plot >= PREBURST_MIN) &
+                         (x_plot <= INTERNAL_FIT_MAX))
+    xI = x_plot[mask_internal_fit]
+    yI = y_plot[mask_internal_fit]
+    yeI = ye_plot[mask_internal_fit]
+    print(f"\nN_internal_fit = {len(xI)},  t in "
+          f"[{xI.min()*1440:.2f} min, {xI.max():.3f} d]")
+    print(f"Launching FS + internal-flare fit ({mode_str})...")
+    chainInternal, lpInternal = _fit_internal(
+        xI, yI, yeI, theta0_internal, args.quick)
 
-    # -----------------------------------------------------------
-    # Fit shifted excess with DSBPL only
-    # -----------------------------------------------------------
-    t_shift_all = x_plot - tburst_offset
-    mask_shift_plot = (t_shift_all > 0) & (t_shift_all <= SHIFT_PLOT_MAX)
-    mask_shift_fit = mask_shift_plot & (t_shift_all <= SHIFT_FIT_MAX)
-    x_shift_plot = t_shift_all[mask_shift_plot]
-    y_shift_plot = y_plot[mask_shift_plot] - model_FS(x_plot[mask_shift_plot], *p_best)
-    ye_shift_plot = ye_plot[mask_shift_plot]
-    fit_mask_plot = t_shift_all[mask_shift_plot] <= SHIFT_FIT_MAX
-    x_shift = t_shift_all[mask_shift_fit]
-    y_shift = y_plot[mask_shift_fit] - model_FS(x_plot[mask_shift_fit], *p_best)
-    ye_shift = ye_plot[mask_shift_fit]
-    print(f"\nN_shift_fit = {len(x_shift)},  shifted t in "
-          f"[{x_shift.min():.5f}, {x_shift.max():.3f}] d")
-    print(f"N_shift_plot = {len(x_shift_plot)},  shifted t in "
-          f"[{x_shift_plot.min():.5f}, {x_shift_plot.max():.3f}] d")
-    print(f"Launching shifted-excess DSBPL fit ({mode_str})...")
-    chainShift, lpShift = _fit_shift(x_shift, y_shift, ye_shift, args.quick)
+    thetaInternal, pInternal, qInternal = summarize(
+        chainInternal, lpInternal, theta_to_params_internal, NAMES_INTERNAL)
+    ymod_internal = windowed_eval(model_internal, xI, pInternal)
+    chi2_internal = np.sum(((yI - ymod_internal) / yeI)**2)
+    chi2_rInternal = chi2_internal / (len(xI) - len(NAMES_INTERNAL))
+    print_params('FORWARD SHOCK + INTERNAL FLARE MODEL',
+                 thetaInternal, NAMES_INTERNAL, qInternal,
+                 ['F0_FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
+                  't_rise (d)', 'tau_rise (min)', 't_off (d)',
+                  'F_peak (uJy)'],
+                 [1e6, 1440, 1e6, 1, 1440, 1, 1e6],
+                 chi2_rInternal)
+    print(f"  {'p':>24s}: {P_INTERNAL:9.3f}   (fixed at FS posterior median)")
+    print(f"  {'beta':>24s}: {BETA_INTERNAL:9.3f}   (fixed)")
+    print(f"  {'curvature slope':>24s}: {-(2+BETA_INTERNAL):9.3f}")
+    print(f"  {'rise timescale (min)':>24s}: {pInternal[4]*1440:9.3f}")
+    print(f"  {'t_off-t_r (min)':>24s}: "
+          f"{(pInternal[5]-pInternal[3])*1440:9.3f}")
 
-    thetaShift, pShift, qShift = summarize(chainShift, lpShift,
-                                           theta_to_params_shift, NAMES_SHIFT)
-    chi2_shift = -2*np.max(lpShift)
-    chi2_rShift = chi2_shift / (len(x_shift) - len(NAMES_SHIFT))
-    print_params('SHIFTED EXCESS DSBPL MODEL', thetaShift, NAMES_SHIFT, qShift,
-                 ['F0 (uJy)', 'tb1 (d)', 'tb2 (d)', 'a1', 'a2', 'a3'],
-                 [1e6, 1, 1, 1, 1, 1],
-                 chi2_rShift)
-    save_corner('SHIFT', chainShift)
-    save_shifted_dsbpl_plot(x_shift_plot, y_shift_plot, ye_shift_plot, fit_mask_plot,
-                            chainShift, lpShift, chi2_rShift,
-                            tburst_offset, t90_eff)
-
-    # -----------------------------------------------------------
-    # Fit combined original-frame model with the second peak evaluated in
-    # its own tau = t - t0_D frame.
-    # -----------------------------------------------------------
-    set_combined_t0_prior(tburst_offset)
-    theta0_combined = theta0_combined_from_fits(thetaFS, pShift, tburst_offset)
-    print("\nShifted DSBPL used as combined-fit initial guess:")
-    print(f"  {'t0_D':>14s}: {tburst_offset:9.5f} d  "
-          f"(prior [{PRIOR_COMBINED['t0_D'][0]:.5f}, {PRIOR_COMBINED['t0_D'][1]:.5f}] d)")
-    print(f"  {'F0_D':>14s}: {pShift[0]*1e6:9.3f} uJy")
-    print(f"  {'tau_b1_D':>14s}: {pShift[1]:9.5f} d  "
-          f"(trigger {tburst_offset + pShift[1]:.5f} d)")
-    print(f"  {'tau_b2_D':>14s}: {pShift[2]:9.5f} d  "
-          f"(trigger {tburst_offset + pShift[2]:.5f} d)")
-    print(f"  {'a1_D':>14s}: {pShift[3]:9.3f}")
-    print(f"  {'a2_D':>14s}: {pShift[4]:9.3f}")
-    print(f"  {'a3_D':>14s}: {pShift[5]:9.3f}")
-
-    combined_fit_max = COMBINED_FIT_MAX
-    mask_combined_fit = ((x_plot >= PREBURST_MIN) &
-                         (x_plot <= combined_fit_max))
-    xC = x_plot[mask_combined_fit]
-    yC = y_plot[mask_combined_fit]
-    yeC = ye_plot[mask_combined_fit]
-    print(f"\nN_combined_fit = {len(xC)},  t in "
-          f"[{xC.min()*1440:.2f} min, {xC.max():.3f} d]")
-    print(f"Launching combined FS+DSBPL fit ({mode_str})...")
-    chainCombined, lpCombined = _fit_combined(xC, yC, yeC, theta0_combined, args.quick)
-
-    thetaCombined, pCombined, qCombined = summarize(
-        chainCombined, lpCombined, theta_to_params_combined, NAMES_COMBINED)
-    chi2_combined = -2*np.max(lpCombined)
-    chi2_rCombined = chi2_combined / (len(xC) - len(NAMES_COMBINED))
-    print_params('COMBINED FS + DSBPL MODEL', thetaCombined, NAMES_COMBINED, qCombined,
-                 ['F0_FS (uJy)', 'tb_FS (min)', 'p',
-                  'F0_D (uJy)', 't0_D (d)', 'tau_b1_D (d)', 'tau_b2_D (d)',
-                  'a1_D', 'a2_D', 'a3_D', 'C_bg (uJy)'],
-                 [1e6, 1440, 1, 1e6, 1, 1, 1, 1, 1, 1, 1e6],
-                 chi2_rCombined)
-    print(f"  {'tb1_D trigger':>24s}: {pCombined[4] + pCombined[5]:9.5f} d")
-    print(f"  {'tb2_D trigger':>24s}: {pCombined[4] + pCombined[6]:9.5f} d")
-    save_corner('COMBINED', chainCombined)
-    save_combined_plot(mask_combined_fit, chainCombined, lpCombined,
-                       chi2_rCombined, tburst_offset)
+    save_corner('INTERNAL', chainInternal)
+    save_internal_plot(mask_internal_fit, chainInternal, lpInternal,
+                       chi2_rInternal)
 
     # -----------------------------------------------------------
     # TESS background plot
     # -----------------------------------------------------------
     save_background_plot([
-        ('Forward shock', chainFS, lpFS, theta_to_params_FS),
-        ('COMBINED', chainCombined, lpCombined, theta_to_params_combined),
+        ('Forward shock', chainFS, lpFS, theta_to_params_FS, 2),
+        ('INTERNAL', chainInternal, lpInternal, theta_to_params_internal, 2),
     ])

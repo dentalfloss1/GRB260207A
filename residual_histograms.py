@@ -1,5 +1,5 @@
 """
-Histogram residuals for the internal and energy-injection combined fits.
+Histogram residuals for the internal-flare and energy-injection fits.
 
 The first run performs quick emcee refits using the same model functions as
 internal_model.py and injection_model.py, then caches the best-fit parameters.
@@ -48,7 +48,7 @@ def best_theta(chain, lp):
     return chain[int(np.argmax(lp))]
 
 
-def fit_internal_combined(quick=True):
+def fit_internal_model(quick=True):
     x_plot, y_plot, ye_plot = load_light_curve(internal)
     internal.x_plot = x_plot
     internal.y_plot = y_plot
@@ -59,36 +59,17 @@ def fit_internal_combined(quick=True):
     chain_fs, lp_fs = internal._fit_FS(
         x_plot[mask_fs], y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
     theta_fs = best_theta(chain_fs, lp_fs)
-    p_fs = internal.theta_to_params_FS(theta_fs)
+    internal.ALPHA_RISE_INTERNAL = internal.fs_rise_posterior_median(chain_fs)
+    internal.S_AB = internal.fs_smoothness_posterior_median(chain_fs)
+    internal.P_INTERNAL = internal.fs_p_posterior_median(chain_fs)
 
-    fs_subtracted = y_plot - internal.model_FS(x_plot, *p_fs)
-    timing_max = internal.FS_FIT_MAX + internal.SHIFT_FIT_MAX
-    tburst_offset, _, _ = internal.compute_effective_t90(
-        x_plot, fs_subtracted, 0.0, timing_max)
-
-    t_shift_all = x_plot - tburst_offset
-    mask_shift_fit = (
-        (t_shift_all > 0) &
-        (t_shift_all <= internal.SHIFT_PLOT_MAX) &
-        (t_shift_all <= internal.SHIFT_FIT_MAX)
-    )
-    chain_shift, lp_shift = internal._fit_shift(
-        t_shift_all[mask_shift_fit],
-        y_plot[mask_shift_fit] - internal.model_FS(x_plot[mask_shift_fit], *p_fs),
-        ye_plot[mask_shift_fit],
-        quick=quick)
-    p_shift = internal.theta_to_params_shift(best_theta(chain_shift, lp_shift))
-
-    internal.set_combined_t0_prior(tburst_offset)
-    theta0_combined = internal.theta0_combined_from_fits(
-        theta_fs, p_shift, tburst_offset)
-
-    mask_combined = ((x_plot >= internal.PREBURST_MIN) &
-                     (x_plot <= internal.COMBINED_FIT_MAX))
-    chain_combined, lp_combined = internal._fit_combined(
-        x_plot[mask_combined], y_plot[mask_combined], ye_plot[mask_combined],
-        theta0_combined, quick=quick)
-    return best_theta(chain_combined, lp_combined)
+    theta0_internal = internal.theta0_internal_from_fs(theta_fs)
+    mask_internal = ((x_plot >= internal.PREBURST_MIN) &
+                     (x_plot <= internal.INTERNAL_FIT_MAX))
+    chain_internal, lp_internal = internal._fit_internal(
+        x_plot[mask_internal], y_plot[mask_internal], ye_plot[mask_internal],
+        theta0_internal, quick=quick)
+    return best_theta(chain_internal, lp_internal)
 
 
 def fit_injection_combined(quick=True):
@@ -120,13 +101,29 @@ def load_or_fit(refit=False, quick=True):
         cache = np.load(CACHE_PATH)
         theta_internal = cache["theta_internal"]
         theta_injection = cache["theta_injection"]
-        cache_version = int(cache["injection_model_version"]) if "injection_model_version" in cache else None
-        if (len(theta_injection) == len(injection.NAMES_INJECTION) and
-                cache_version == injection.INJECTION_MODEL_VERSION):
+        injection_cache_version = (int(cache["injection_model_version"])
+                                   if "injection_model_version" in cache else None)
+        internal_cache_version = (int(cache["internal_model_version"])
+                                  if "internal_model_version" in cache else None)
+        fixed_keys = {
+            "p_internal", "alpha_rise_internal", "s_internal",
+            "p_injection", "alpha_rise_injection", "s_injection",
+        }
+        if (fixed_keys.issubset(cache.files) and
+                len(theta_internal) == len(internal.NAMES_INTERNAL) and
+                internal_cache_version == internal.INTERNAL_MODEL_VERSION and
+                len(theta_injection) == len(injection.NAMES_INJECTION) and
+                injection_cache_version == injection.INJECTION_MODEL_VERSION):
+            internal.P_INTERNAL = float(cache["p_internal"])
+            internal.ALPHA_RISE_INTERNAL = float(cache["alpha_rise_internal"])
+            internal.S_AB = float(cache["s_internal"])
+            injection.P_INJECTION = float(cache["p_injection"])
+            injection.ALPHA_RISE_INJECTION = float(cache["alpha_rise_injection"])
+            injection.S_AB = float(cache["s_injection"])
             return theta_internal, theta_injection, "cache"
-        print("Cached injection fit is stale; refitting.")
+        print("Cached fit is stale; refitting.")
 
-    theta_internal = fit_internal_combined(quick=quick)
+    theta_internal = fit_internal_model(quick=quick)
 
     # _fit_FS exists in both modules with the same name; reloading keeps the
     # globals and priors for the injection run independent from the internal run.
@@ -137,7 +134,14 @@ def load_or_fit(refit=False, quick=True):
         CACHE_PATH,
         theta_internal=theta_internal,
         theta_injection=theta_injection,
+        internal_model_version=internal.INTERNAL_MODEL_VERSION,
         injection_model_version=injection.INJECTION_MODEL_VERSION,
+        p_internal=internal.P_INTERNAL,
+        alpha_rise_internal=internal.ALPHA_RISE_INTERNAL,
+        s_internal=internal.S_AB,
+        p_injection=injection.P_INJECTION,
+        alpha_rise_injection=injection.ALPHA_RISE_INJECTION,
+        s_injection=injection.S_AB,
     )
     return theta_internal, theta_injection, "refit"
 
@@ -170,9 +174,9 @@ def add_stat_lines(ax, values, bins, color_model):
 
 def make_plot(theta_internal, theta_injection):
     residuals = {
-        "Internal combined FS+DSBPL": residual_set(
-            internal, theta_internal, internal.theta_to_params_combined,
-            internal.model_combined),
+        "Internal FS+flare fit": residual_set(
+            internal, theta_internal, internal.theta_to_params_internal,
+            internal.model_internal),
         "Energy-injection combined fit": residual_set(
             injection, theta_injection, injection.theta_to_params_injection,
             injection.model_injection),

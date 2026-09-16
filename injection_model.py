@@ -45,7 +45,7 @@ FS_FIT_MAX = 0.02            # days post-burst
 INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
 PREBURST_MIN = -1.0          # one day before trigger
 PREBURST_MAX = 0.0           # trigger
-INJECTION_MODEL_VERSION = 14  # Bump when cached fit coordinates/data choices change.
+INJECTION_MODEL_VERSION = 17  # Bump when cached fit coordinates/data choices change.
 INJECTION_PLOT_CACHE = 'GRB260207A_injection_fit_cache.npz'
 
 # ---------------------------------------------------------------
@@ -897,7 +897,7 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r,
     print(f"Saved: {output_path}")
 
 def save_injection_plot_cache(chain, lp, chi2_r, output_path=INJECTION_PLOT_CACHE,
-                              max_samples=2000):
+                              max_samples=2000, quick=False):
     """Persist enough posterior information to redraw the injection figure.
 
     This deliberately stores a representative subset rather than an entire
@@ -921,6 +921,7 @@ def save_injection_plot_cache(chain, lp, chi2_r, output_path=INJECTION_PLOT_CACH
         p_injection=np.array(P_INJECTION),
         alpha_rise_injection=np.array(ALPHA_RISE_INJECTION),
         s_ab=np.array(S_AB),
+        quick=np.array(quick),
     )
     print(f"Saved reusable injection plotting cache: {output_path}")
 
@@ -942,6 +943,7 @@ def load_injection_plot_cache(input_path=INJECTION_PLOT_CACHE):
             'p_injection': float(cache['p_injection']),
             'alpha_rise_injection': float(cache['alpha_rise_injection']),
             's_ab': float(cache['s_ab']),
+            'quick': bool(cache['quick']),
         }
 
 def save_curved_injection_plot(mask_injection_fit, chain, lp, chi2_r):
@@ -1214,16 +1216,25 @@ if __name__ == '__main__':
                 print(f"Cannot reuse {INJECTION_PLOT_CACHE}: {exc}")
                 print("Proceeding with a new fit; its plotting results will be cached.")
             else:
-                P_INJECTION = plot_cache['p_injection']
-                ALPHA_RISE_INJECTION = plot_cache['alpha_rise_injection']
-                S_AB = plot_cache['s_ab']
-                mask_injection_fit = ((x_plot >= PREBURST_MIN) &
-                                      (x_plot <= INJECTION_FIT_MAX))
-                print(f"Reusing injection fit from {INJECTION_PLOT_CACHE}")
-                save_injection_plot(
-                    mask_injection_fit, plot_cache['chain'], plot_cache['lp'],
-                    plot_cache['chi2_r'], presentation_format=True)
-                raise SystemExit(0)
+                if plot_cache['quick'] and not args.quick:
+                    print(f"Cannot reuse {INJECTION_PLOT_CACHE}: it contains "
+                          "an unconverged quick fit")
+                    print("Proceeding with a new adaptive fit; its plotting "
+                          "results will be cached.")
+                    plot_cache = None
+                if plot_cache is None:
+                    pass
+                else:
+                    P_INJECTION = plot_cache['p_injection']
+                    ALPHA_RISE_INJECTION = plot_cache['alpha_rise_injection']
+                    S_AB = plot_cache['s_ab']
+                    mask_injection_fit = ((x_plot >= PREBURST_MIN) &
+                                          (x_plot <= INJECTION_FIT_MAX))
+                    print(f"Reusing injection fit from {INJECTION_PLOT_CACHE}")
+                    save_injection_plot(
+                        mask_injection_fit, plot_cache['chain'], plot_cache['lp'],
+                        plot_cache['chi2_r'], presentation_format=True)
+                    raise SystemExit(0)
         else:
             print(f"No reusable fit cache found at {INJECTION_PLOT_CACHE}.")
             print("Proceeding with a new fit; its plotting results will be cached.")
@@ -1380,7 +1391,8 @@ if __name__ == '__main__':
     print(f"  {'RS decay alpha':>24s}: {alpha_RS_decay:9.3f}   (flux ∝ tau^-alpha)")
     print(f"  {'RS flux decay slope':>24s}: {-alpha_RS_decay:9.3f}")
 
-    save_injection_plot_cache(chainInjection, lpInjection, chi2_rInjection)
+    save_injection_plot_cache(chainInjection, lpInjection, chi2_rInjection,
+                              quick=args.quick)
 
     if args.curved_injection:
         theta0_curved = np.append(thetaInjection, 0.0)
