@@ -891,7 +891,8 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r,
     output_path = ('GRB260207A_emcee_injection_presentation.png'
                    if presentation_format else
                    'GRB260207A_emcee_injection.png')
-    plt.savefig(output_path, dpi=130, bbox_inches='tight')
+    output_dpi = 300 if presentation_format else 130
+    plt.savefig(output_path, dpi=output_dpi, bbox_inches='tight')
     plt.close()
     print(f"Saved: {output_path}")
 
