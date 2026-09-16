@@ -28,13 +28,20 @@ TIME_MAX = 1.0
 
 def load_light_curve(module):
     rawdata = np.loadtxt("lc_GRB260207A_cand41148_geo")
-    x_all = rawdata[:, 0] - module.trigger_tjd
+    x_all = rawdata[:, 0] + module.HALF_C - module.trigger_tjd
     y_all = -rawdata[:, 1] / (200 * 0.8 * 0.99)
     yerr_all = rawdata[:, 2] / (200 * 0.8 * 0.99)
     zp = 2416 * 10 ** (-0.4 * 20.44)
+    flux_all = y_all * zp
+    eflux_all = yerr_all * zp
 
-    mask_plot = (x_all >= -1.0) & (x_all <= 12.0)
-    return x_all[mask_plot], y_all[mask_plot] * zp, yerr_all[mask_plot] * zp
+    pre = ((x_all >= module.PREBURST_MIN) &
+           (x_all <= module.PREBURST_MAX))
+    jitter = module.estimate_additive_jitter(flux_all[pre], eflux_all[pre])
+    eflux_eff_all = np.sqrt(eflux_all**2 + jitter**2)
+
+    mask_plot = (x_all >= module.PREBURST_MIN) & (x_all <= 12.0)
+    return x_all[mask_plot], flux_all[mask_plot], eflux_eff_all[mask_plot]
 
 
 def best_theta(chain, lp):
@@ -47,7 +54,8 @@ def fit_internal_combined(quick=True):
     internal.y_plot = y_plot
     internal.ye_plot = ye_plot
 
-    mask_fs = (x_plot >= -1.0) & (x_plot <= internal.FS_FIT_MAX)
+    mask_fs = ((x_plot >= internal.PREBURST_MIN) &
+               (x_plot <= internal.FS_FIT_MAX))
     chain_fs, lp_fs = internal._fit_FS(
         x_plot[mask_fs], y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
     theta_fs = best_theta(chain_fs, lp_fs)
@@ -75,7 +83,8 @@ def fit_internal_combined(quick=True):
     theta0_combined = internal.theta0_combined_from_fits(
         theta_fs, p_shift, tburst_offset)
 
-    mask_combined = (x_plot >= -1.0) & (x_plot <= internal.COMBINED_FIT_MAX)
+    mask_combined = ((x_plot >= internal.PREBURST_MIN) &
+                     (x_plot <= internal.COMBINED_FIT_MAX))
     chain_combined, lp_combined = internal._fit_combined(
         x_plot[mask_combined], y_plot[mask_combined], ye_plot[mask_combined],
         theta0_combined, quick=quick)
@@ -88,14 +97,18 @@ def fit_injection_combined(quick=True):
     injection.y_plot = y_plot
     injection.ye_plot = ye_plot
 
-    mask_fs = (x_plot >= -1.0) & (x_plot <= injection.FS_FIT_MAX)
+    mask_fs = ((x_plot >= injection.PREBURST_MIN) &
+               (x_plot <= injection.FS_FIT_MAX))
     chain_fs, lp_fs = injection._fit_FS(
         x_plot[mask_fs], y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
     theta_fs = best_theta(chain_fs, lp_fs)
-    injection.S_AB = injection.theta_to_params_FS(theta_fs)[3]
+    injection.ALPHA_RISE_INJECTION = injection.fs_rise_posterior_median(chain_fs)
+    injection.S_AB = injection.fs_smoothness_posterior_median(chain_fs)
+    injection.P_INJECTION = injection.fs_p_posterior_median(chain_fs)
 
     theta0_injection = injection.theta0_injection_from_fs(theta_fs)
-    mask_injection = (x_plot >= -1.0) & (x_plot <= injection.COMBINED_FIT_MAX)
+    mask_injection = ((x_plot >= injection.PREBURST_MIN) &
+                      (x_plot <= injection.INJECTION_FIT_MAX))
     chain_injection, lp_injection = injection._fit_injection(
         x_plot[mask_injection], y_plot[mask_injection], ye_plot[mask_injection],
         theta0_injection, quick=quick)

@@ -34,6 +34,8 @@ FS_FIT_MAX = 0.02            # days post-burst
 SHIFT_FIT_MAX = 0.08         # days after computed shifted origin for DSBPL fit
 SHIFT_PLOT_MAX = 1.0         # days after computed shifted origin for DSBPL plot
 COMBINED_FIT_MAX = 6.5       # days post-burst for combined FS+DSBPL fit
+PREBURST_MIN = -1.0          # one day before trigger
+PREBURST_MAX = 0.0           # trigger
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
@@ -79,6 +81,51 @@ def windowed_eval(model_fn, t_arr, params):
         f[valid] = model_fn(ts[valid], *params)
         out[i] = np.trapezoid(f, ts) / CADENCE
     return out
+
+def fit_constant_background(flux, flux_err):
+    """Weighted constant fit; returns mean, mean error, chi2, and dof."""
+    flux = np.asarray(flux, dtype=float)
+    flux_err = np.asarray(flux_err, dtype=float)
+    valid = np.isfinite(flux) & np.isfinite(flux_err) & (flux_err > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Need at least two finite points to fit a constant background")
+    flux = flux[valid]
+    flux_err = flux_err[valid]
+    weight = 1.0 / flux_err**2
+    mean = np.sum(weight * flux) / np.sum(weight)
+    mean_err = np.sqrt(1.0 / np.sum(weight))
+    chi2 = np.sum(((flux - mean) / flux_err)**2)
+    return mean, mean_err, chi2, len(flux) - 1
+
+def estimate_additive_jitter(flux, flux_err):
+    """Find a constant error floor that gives a constant fit chi2/dof = 1.
+
+    The background mean is re-fit for every trial jitter. The returned jitter
+    has the same units as ``flux`` and is zero when the formal errors already
+    give chi2/dof <= 1.
+    """
+    _, _, chi2, dof = fit_constant_background(flux, flux_err)
+    if chi2 <= dof:
+        return 0.0
+
+    flux_err = np.asarray(flux_err, dtype=float)
+    finite_err = flux_err[np.isfinite(flux_err) & (flux_err > 0)]
+
+    def excess_chi2(jitter):
+        effective_err = np.sqrt(flux_err**2 + jitter**2)
+        return fit_constant_background(flux, effective_err)[2] - dof
+
+    lower = 0.0
+    upper = float(np.median(finite_err))
+    while excess_chi2(upper) > 0:
+        upper *= 2.0
+    for _ in range(80):
+        midpoint = 0.5 * (lower + upper)
+        if excess_chi2(midpoint) > 0:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return 0.5 * (lower + upper)
 
 # ===============================================================
 # Forward-shock model — SBPL + TESS-bg constant, S=0.02
@@ -438,7 +485,7 @@ def save_corner(tag, flat_chain):
         quantiles=[0.16, 0.5, 0.84],
         show_titles=True,
         title_fmt='.2f',
-        label_kwargs={'fontsize': 15, 'labelpad': 0.16},
+        label_kwargs={'fontsize': 14, 'labelpad': 14},
         title_kwargs={'fontsize': 13},
     )
     try:
@@ -447,7 +494,9 @@ def save_corner(tag, flat_chain):
     except Exception:
         fig_c = corner.corner(samp, **corner_kwargs)
     for ax in fig_c.axes:
-        ax.tick_params(axis='both', labelsize=11)
+        ax.tick_params(axis='both', labelsize=9, pad=3)
+        ax.xaxis.labelpad = 14
+        ax.yaxis.labelpad = 14
     fig_c.savefig(f'GRB260207A_corner_{tag}.png', dpi=160, bbox_inches='tight')
     plt.close(fig_c)
     print(f"Saved: GRB260207A_corner_{tag}.png")
@@ -828,29 +877,49 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     rawdata   = np.loadtxt('lc_GRB260207A_cand41148_geo')
-    x_all     = rawdata[:, 0] - trigger_tjd
+    # The light-curve timestamps are cadence starts; model and plot at midtimes.
+    x_all     = rawdata[:, 0] + HALF_C - trigger_tjd
     y_all     = -rawdata[:, 1] / (200 * 0.8 * 0.99)
     yerr_all  =  rawdata[:, 2] / (200 * 0.8 * 0.99)
     zp        = 2416 * 10**(-0.4 * 20.44)
     flux_all  = y_all    * zp
     eflux_all = yerr_all * zp
 
-    # Include 6 h pre-burst for background constraint, out to 12 d post-burst
-    mask_plot = (x_all >= -1.0) & (x_all <= 12.0)
+    # Calibrate an additive photometric noise floor from the full one-day
+    # pre-burst interval, where the source model is a constant background.
+    # This captures cadence-level confusion and subtraction scatter associated
+    # with unresolved sources and background structure in the large TESS pixels.
+    pre = (x_all >= PREBURST_MIN) & (x_all <= PREBURST_MAX)
+    _, _, chi2_formal, dof_bg = fit_constant_background(
+        flux_all[pre], eflux_all[pre])
+    jitter_flux = estimate_additive_jitter(flux_all[pre], eflux_all[pre])
+    jitter_cps = jitter_flux / zp
+    yerr_eff_all = np.sqrt(yerr_all**2 + jitter_cps**2)
+    eflux_eff_all = yerr_eff_all * zp
+    bg_eff, bg_eff_err, chi2_eff, _ = fit_constant_background(
+        flux_all[pre], eflux_eff_all[pre])
+    print("Pre-burst additive-jitter calibration:")
+    print(f"  N={pre.sum()}, interval=[{PREBURST_MIN:.1f}, {PREBURST_MAX:.1f}] d")
+    print(f"  constant background={bg_eff*1e6:.3f} +/- {bg_eff_err*1e6:.3f} uJy")
+    print(f"  formal chi2/dof={chi2_formal:.2f}/{dof_bg}={chi2_formal/dof_bg:.3f}")
+    print(f"  jitter={jitter_flux*1e6:.3f} uJy ({jitter_cps:.3f} counts/s)")
+    print(f"  effective chi2/dof={chi2_eff:.2f}/{dof_bg}={chi2_eff/dof_bg:.3f}")
+
+    # Include 1 d (24 h) pre-burst for the background constraint, out to 12 d post-burst.
+    mask_plot = (x_all >= PREBURST_MIN) & (x_all <= 12.0)
     x_plot  = x_all[mask_plot]
     y_plot  = flux_all[mask_plot]
-    ye_plot = eflux_all[mask_plot]
+    ye_plot = eflux_eff_all[mask_plot]
 
     if args.nomodel:
         # --- Extended mask: first cadence onward through end of data
         mask_ext = (x_all > -HALF_C) & (x_all <= x_all.max())
         xp   = x_all[mask_ext]
         yp   = y_all[mask_ext]
-        yep  = yerr_all[mask_ext]
+        yep  = yerr_eff_all[mask_ext]
 
-        # --- Pre-burst baseline: weighted mean of all t in [-6 h, 0]
-        pre = (x_all >= -1.0) & (x_all <= 0)
-        wt      = 1.0 / yerr_all[pre]**2
+        # --- Pre-burst baseline: weighted mean over the full interval t in [-1 d, 0]
+        wt      = 1.0 / yerr_eff_all[pre]**2
         bkg_val = np.sum(wt * y_all[pre]) / np.sum(wt)
         bkg_err = np.sqrt(1.0 / np.sum(wt))
         print(f"Pre-burst baseline: {bkg_val:.4f} +/- {bkg_err:.4f} cps  (N={pre.sum()})")
@@ -942,7 +1011,7 @@ if __name__ == '__main__':
         raise SystemExit(0)
 
     # Fit only through 0.02 d post-burst, keeping pre-burst data for background.
-    mask_fit = (x_plot >= -1.0) & (x_plot <= FS_FIT_MAX)
+    mask_fit = (x_plot >= PREBURST_MIN) & (x_plot <= FS_FIT_MAX)
     xD = x_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
     print(f"N_fit = {len(xD)},  t in [{xD.min()*1440:.2f} min, {xD.max():.3f} d]")
 
@@ -1076,7 +1145,8 @@ if __name__ == '__main__':
     print(f"  {'a3_D':>14s}: {pShift[5]:9.3f}")
 
     combined_fit_max = COMBINED_FIT_MAX
-    mask_combined_fit = (x_plot >= -1.0) & (x_plot <= combined_fit_max)
+    mask_combined_fit = ((x_plot >= PREBURST_MIN) &
+                         (x_plot <= combined_fit_max))
     xC = x_plot[mask_combined_fit]
     yC = y_plot[mask_combined_fit]
     yeC = ye_plot[mask_combined_fit]

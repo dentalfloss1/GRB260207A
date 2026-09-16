@@ -12,7 +12,9 @@ episode that drives two different shock responses:
 The forward shock responds to cumulative injected energy. The reverse shock is
 a single smoothly broken power law in shifted time, peaking at t_cross, and is
 not multiplied by the same energy factor. The background is never multiplied by
-either source component.
+either source component. The injection fits fix the electron index p to the
+forward-shock posterior median; p sets both the forward-shock decay and its
+response to the injected energy.
 """
 
 import os
@@ -41,7 +43,10 @@ HALF_WIN   = CADENCE / 2.0
 WIN_THRESH = 5.0 / 1440      # 5 min in days
 FS_FIT_MAX = 0.02            # days post-burst
 INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
-INJECTION_MODEL_VERSION = 8  # Bump when injection sampler coordinates change.
+PREBURST_MIN = -1.0          # one day before trigger
+PREBURST_MAX = 0.0           # trigger
+INJECTION_MODEL_VERSION = 14  # Bump when cached fit coordinates/data choices change.
+INJECTION_PLOT_CACHE = 'GRB260207A_injection_fit_cache.npz'
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
@@ -83,33 +88,89 @@ def windowed_eval(model_fn, t_arr, params):
         out[i] = np.trapezoid(f, ts) / CADENCE
     return out
 
+def fit_constant_background(flux, flux_err):
+    """Weighted constant fit; returns mean, mean error, chi2, and dof."""
+    flux = np.asarray(flux, dtype=float)
+    flux_err = np.asarray(flux_err, dtype=float)
+    valid = np.isfinite(flux) & np.isfinite(flux_err) & (flux_err > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("Need at least two finite points to fit a constant background")
+    flux = flux[valid]
+    flux_err = flux_err[valid]
+    weight = 1.0 / flux_err**2
+    mean = np.sum(weight * flux) / np.sum(weight)
+    mean_err = np.sqrt(1.0 / np.sum(weight))
+    chi2 = np.sum(((flux - mean) / flux_err)**2)
+    return mean, mean_err, chi2, len(flux) - 1
+
+def estimate_additive_jitter(flux, flux_err):
+    """Find a constant error floor that gives a constant fit chi2/dof = 1.
+
+    The background mean is re-fit for every trial jitter. The returned jitter
+    has the same units as ``flux`` and is zero when the formal errors already
+    give chi2/dof <= 1.
+    """
+    _, _, chi2, dof = fit_constant_background(flux, flux_err)
+    if chi2 <= dof:
+        return 0.0
+
+    flux_err = np.asarray(flux_err, dtype=float)
+    finite_err = flux_err[np.isfinite(flux_err) & (flux_err > 0)]
+
+    def excess_chi2(jitter):
+        effective_err = np.sqrt(flux_err**2 + jitter**2)
+        return fit_constant_background(flux, effective_err)[2] - dof
+
+    lower = 0.0
+    upper = float(np.median(finite_err))
+    while excess_chi2(upper) > 0:
+        upper *= 2.0
+    for _ in range(80):
+        midpoint = 0.5 * (lower + upper)
+        if excess_chi2(midpoint) > 0:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return 0.5 * (lower + upper)
+
 # ===============================================================
 # Forward-shock model — SBPL + TESS-bg constant
-# theta: [logF0, logTb, logC_bg, logS_FS]
+# theta: [logF0, logTb, logC_bg, logS_FS, p]
 # ===============================================================
-FS_RISE_ALPHA = -0.5
-P_FIXED = 2.3
+ALPHA_RISE_INITIAL = 0.5
+# Fixed at the FS posterior median for the injection stage (see driver).
+ALPHA_RISE_INJECTION = ALPHA_RISE_INITIAL
+P_INITIAL = 2.3
+P_INJECTION = P_INITIAL
 
 def decay_alpha_from_p(p):
     return 3.0 * (p - 1.0) / 4.0
 
-def forward_shock_source_flux(t, F0, tb, p, S=None):
-    """Source-only forward-shock flux; zero before the trigger."""
+def forward_shock_source_flux(t, F0, tb, p, S=None, alpha_rise=None):
+    """Source-only forward-shock flux; zero before the trigger.
+
+    alpha_rise is the physical rise slope (flux propto t**+alpha_rise); sbpl
+    takes it with the opposite sign. Defaults fall back to the module-level
+    values fixed from the FS posterior.
+    """
     t = np.asarray(t, dtype=float)
     pos = t > 0
     ts = np.where(pos, t, 1e-10)
     a2 = decay_alpha_from_p(p)
     smooth = S_AB if S is None else S
-    return np.where(pos, sbpl(ts, F0, tb, FS_RISE_ALPHA, a2, smooth), 0.0)
+    a1 = -(ALPHA_RISE_INJECTION if alpha_rise is None else alpha_rise)
+    return np.where(pos, sbpl(ts, F0, tb, a1, a2, smooth), 0.0)
 
-def model_FS(t, F0, tb, C_bg, S_FS):
-    return forward_shock_source_flux(t, F0, tb, P_FIXED, S_FS) + C_bg
+def model_FS(t, F0, tb, C_bg, S_FS, p, alpha_rise_FS):
+    return forward_shock_source_flux(t, F0, tb, p, S_FS, alpha_rise_FS) + C_bg
 
 PRIOR_FS = {
     'logF0':   (-6.0, -2.3),
     'logTb':   (-2.523, -1.699),  # 3–30 min, matching the original P1 range
     'logC_bg': (-10.0, -4.0),
-    'logS_FS': (np.log10(0.01), np.log10(1.5)),
+    'logS_FS': (np.log10(0.005), np.log10(0.5)),
+    'p':       (1.5, 3.0),
+    'alpha_rise_FS': (0.0, 2.0),
 }
 NAMES_FS = list(PRIOR_FS.keys())
 
@@ -119,8 +180,8 @@ def log_prior_FS(theta):
     return 0.0
 
 def theta_to_params_FS(theta):
-    logF0, logTb, logC_bg, logS_FS = theta
-    return (10**logF0, 10**logTb, 10**logC_bg, 10**logS_FS)
+    logF0, logTb, logC_bg, logS_FS, p, alpha_rise_FS = theta
+    return (10**logF0, 10**logTb, 10**logC_bg, 10**logS_FS, p, alpha_rise_FS)
 
 def log_prob_FS(theta, x, y, yerr):
     lp = log_prior_FS(theta)
@@ -132,19 +193,37 @@ def log_prob_FS(theta, x, y, yerr):
     return lp - 0.5 * np.sum(((y - ymod) / yerr)**2)
 
 def get_components_FS(t, p):
-    # p: F0, tb, C_bg, S_FS
-    a2  = decay_alpha_from_p(P_FIXED)
-    fs  = forward_shock_source_flux(t, p[0], p[1], P_FIXED, p[3])
+    # p: F0, tb, C_bg, S_FS, electron-index p, rise slope
+    a2  = decay_alpha_from_p(p[4])
+    fs  = forward_shock_source_flux(t, p[0], p[1], p[4], p[3], p[5])
     cbg = np.full_like(t, p[2])
     return [
         ('Forward shock', fs, '--', 'goldenrod',
          f"tb={p[1]*1440:.1f} min  S={p[3]:.3f}  "
-         f"rise=+0.50  decay=-{a2:.2f}  p={P_FIXED:.2f}"),
+         f"rise=+{p[5]:.2f}  decay=-{a2:.2f}  p={p[4]:.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={p[2]*1e6:.2f} µJy"),
     ]
 
-theta0_FS = np.array([np.log10(7e-4), np.log10(10/1440), -4.5, np.log10(S_AB)])
+theta0_FS = np.array([
+    np.log10(7e-4), np.log10(10/1440), -4.5, np.log10(S_AB), P_INITIAL,
+    ALPHA_RISE_INITIAL,
+])
+
+def fs_smoothness_posterior_median(flat_chain):
+    """Marginal posterior median of physical S_FS from an FS theta chain."""
+    log_s_index = NAMES_FS.index('logS_FS')
+    return float(np.median(10**np.asarray(flat_chain)[:, log_s_index]))
+
+def fs_rise_posterior_median(flat_chain):
+    """Marginal posterior median of the FS rise slope from an FS theta chain."""
+    rise_index = NAMES_FS.index('alpha_rise_FS')
+    return float(np.median(np.asarray(flat_chain)[:, rise_index]))
+
+def fs_p_posterior_median(flat_chain):
+    """Marginal posterior median of p from an FS theta chain."""
+    p_index = NAMES_FS.index('p')
+    return float(np.median(np.asarray(flat_chain)[:, p_index]))
 
 # ===============================================================
 # Refreshed forward-shock model — shared injection episode, separate responses.
@@ -238,11 +317,11 @@ def model_injection(t, F0_FS, tb_FS, C_bg,
                     t_start, t_cross, log10_RE, F_RS_cross,
                     alpha_RS_rise, alpha_RS_decay, f_energy):
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_INJECTION)
     e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log10_RE)
     rs = reverse_shock_sbpl(
         t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
-    return f_fs0 * e_ratio**energy_flux_index(P_FIXED) + rs + C_bg
+    return f_fs0 * e_ratio**energy_flux_index(P_INJECTION) + rs + C_bg
 
 NAMES_CURVED_INJECTION = NAMES_INJECTION + ['kappa']
 PRIOR_CURVED_INJECTION = dict(PRIOR_INJECTION)
@@ -252,12 +331,12 @@ def model_curved_injection(t, F0_FS, tb_FS, C_bg,
                            t_start, t_cross, log10_RE, F_RS_cross,
                            alpha_RS_rise, alpha_RS_decay, f_energy, kappa):
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    f_fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_INJECTION)
     e_ratio = energy_ratio_curved_injection(
         t, t_start, t_energy_end, log10_RE, kappa)
     rs = reverse_shock_sbpl(
         t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
-    return f_fs0 * e_ratio**energy_flux_index(P_FIXED) + rs + C_bg
+    return f_fs0 * e_ratio**energy_flux_index(P_INJECTION) + rs + C_bg
 
 def log_prior_injection(theta):
     for v, (lo, hi) in zip(theta, PRIOR_INJECTION.values()):
@@ -356,16 +435,17 @@ def get_components_injection(t, p):
     (F0_FS, tb_FS, C_bg, t_start, t_cross, log10_RE,
      F_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy) = p
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_INJECTION)
     e_ratio = energy_ratio_injection(t, t_start, t_energy_end, log10_RE)
-    fs_refreshed = fs0 * e_ratio**energy_flux_index(P_FIXED)
+    fs_refreshed = fs0 * e_ratio**energy_flux_index(P_INJECTION)
     rs = reverse_shock_sbpl(
         t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
     cbg = np.full_like(t, C_bg)
     return [
         ('Unrefreshed FS', fs0 + C_bg, '--', 'dimgray',
-         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_FIXED):.2f}"),
-        ('Refreshed FS', fs_refreshed + C_bg, '-', 'darkorange',
+         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_INJECTION):.2f}  "
+         f"p={P_INJECTION:.2f}"),
+        ('Refreshed FS', fs_refreshed + C_bg, '--', 'darkorange',
          f"R_E={10**log10_RE:.2f}"),
         ('Reverse shock', rs, ':', 'crimson',
          f"F(t_cross)={F_RS_cross*1e6:.2f} uJy  "
@@ -378,16 +458,17 @@ def get_components_curved_injection(t, p):
     (F0_FS, tb_FS, C_bg, t_start, t_cross, log10_RE,
      F_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy, kappa) = p
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_FIXED)
+    fs0 = forward_shock_source_flux(t, F0_FS, tb_FS, P_INJECTION)
     e_ratio = energy_ratio_curved_injection(
         t, t_start, t_energy_end, log10_RE, kappa)
-    fs_refreshed = fs0 * e_ratio**energy_flux_index(P_FIXED)
+    fs_refreshed = fs0 * e_ratio**energy_flux_index(P_INJECTION)
     rs = reverse_shock_sbpl(
         t, F_RS_cross, t_start, t_cross, alpha_RS_rise, alpha_RS_decay)
     cbg = np.full_like(t, C_bg)
     return [
         ('Unrefreshed FS', fs0 + C_bg, '--', 'dimgray',
-         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_FIXED):.2f}"),
+         f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_INJECTION):.2f}  "
+         f"p={P_INJECTION:.2f}"),
         ('Curved refreshed FS', fs_refreshed + C_bg, '-', 'teal',
          f"R_E={10**log10_RE:.2f}  kappa={kappa:.2f}"),
         ('Reverse shock', rs, ':', 'crimson',
@@ -508,9 +589,10 @@ def print_params(title, theta_best, param_names, quantiles,
 _CORNER_CFG = {
     'FS': dict(
         names=NAMES_FS,
-        scale=[1e6, 1440, 1e6, 1],
+        scale=[1e6, 1440, 1e6, 1, 1, 1],
         labels=[r'$F_0\ (\mu\mathrm{Jy})$', r'$t_b\ (\mathrm{min})$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$S_{\rm FS}$'],
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$S_{\rm FS}$', r'$p$',
+                r'$\alpha_{\rm FS,rise}$'],
     ),
     'INJECTION': dict(
         names=NAMES_INJECTION,
@@ -538,18 +620,13 @@ _INJECTION_CORNER_DPI = 180
 _INJECTION_CORNER_FIGSIZE = (2700 / _INJECTION_CORNER_DPI,
                              2730 / _INJECTION_CORNER_DPI)
 _INJECTION_CORNER_FONT_CANDIDATES = (
-    (30, 24, 19),
-    (29, 23, 19),
-    (28, 23, 18),
-    (27, 22, 18),
-    (26, 21, 17),
-    (25, 20, 16),
-    (24, 19, 16),
-    (23, 18, 15),
-    (22, 17, 14),
-    (21, 16, 14),
-    (20, 16, 13),
-    (19, 15, 13),
+    (22, 19, 12),
+    (21, 18, 12),
+    (20, 17, 11),
+    (19, 16, 11),
+    (18, 15, 10),
+    (17, 14, 10),
+    (16, 13, 9),
 )
 
 def _compact_corner_titles(samples, fmt='.2f'):
@@ -586,13 +663,13 @@ def _texts_overlap(fig):
 
 def _set_corner_text_sizes(fig, label_size, title_size, tick_size):
     for ax in fig.axes:
-        ax.tick_params(axis='both', labelsize=tick_size, pad=1)
+        ax.tick_params(axis='both', labelsize=tick_size, pad=3)
         ax.xaxis.label.set_size(label_size)
         ax.yaxis.label.set_size(label_size)
         ax.xaxis.get_offset_text().set_size(tick_size)
         ax.yaxis.get_offset_text().set_size(tick_size)
-        ax.xaxis.labelpad = 7
-        ax.yaxis.labelpad = 7
+        ax.xaxis.labelpad = 16
+        ax.yaxis.labelpad = 16
         ax.title.set_size(title_size)
 
 def _fit_injection_corner_text(fig):
@@ -625,8 +702,8 @@ def save_corner(tag, flat_chain):
         quantiles=[0.16, 0.5, 0.84],
         show_titles=not is_injection,
         title_fmt='.2f',
-        label_kwargs={'fontsize': 26 if is_injection else 15, 'labelpad': 5 if is_injection else 8},
-        title_kwargs={'fontsize': 21 if is_injection else 13},
+        label_kwargs={'fontsize': 20 if is_injection else 15, 'labelpad': 18 if is_injection else 12},
+        title_kwargs={'fontsize': 17 if is_injection else 13},
         fig=fig,
     )
     try:
@@ -700,7 +777,8 @@ def add_minutes_axis(ax):
     ax_min.set_xticklabels([str(m) for m in min_ticks], fontsize=8)
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
-def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
+def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color,
+                   show_legend=True):
     visible  = (x_plot >= 1e-4) & (x_plot <= 13)
     pos_fit  = mask_used & visible
     pos_excl = ~mask_used & visible
@@ -755,10 +833,12 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
     ax_res.set_xscale('log'); ax_res.set_xlim(1e-4, 13); ax_res.set_ylim(-ymax, ymax)
     ax_res.set_xlabel('Days post-burst', fontsize=11)
     ax_res.set_ylabel('Residuals (σ)', fontsize=10)
-    ax_res.legend(fontsize=7, loc='upper right')
+    if show_legend:
+        ax_res.legend(fontsize=7, loc='upper right')
     ax_res.grid(True, which='both', alpha=0.2, lw=0.5)
 
-def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
+def save_injection_plot(mask_injection_fit, chain, lp, chi2_r,
+                        presentation_format=False):
     p_best = theta_to_params_injection(chain[np.argmax(lp)])
     t_model = np.logspace(np.log10(2e-4), np.log10(13), 1500)
     color = MODEL_COLOR['INJECTION']
@@ -791,19 +871,74 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r):
                    label=f'{lbl}={tx:.4f} d')
 
     format_main_ax(ax)
+    if presentation_format:
+        ax.set_ylim(5e-5, 1e-3)
     ax.tick_params(labelbottom=False)
     ax.spines['bottom'].set_visible(False)
     ax_res.spines['top'].set_visible(False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
     ax.set_title('Refreshed forward shock with tied reverse-shock component', fontsize=10)
-    ax.legend(fontsize=5.9, loc='best')
+    if not presentation_format:
+        ax.legend(fontsize=5.9, loc='best')
     add_minutes_axis(ax)
-    plot_residuals(ax_res, mask_injection_fit, model_injection, p_best, color)
+    plot_residuals(ax_res, mask_injection_fit, model_injection, p_best, color,
+                   show_legend=not presentation_format)
 
     plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
-    plt.savefig('GRB260207A_emcee_injection.png', dpi=130, bbox_inches='tight')
+    output_path = ('GRB260207A_emcee_injection_presentation.png'
+                   if presentation_format else
+                   'GRB260207A_emcee_injection.png')
+    plt.savefig(output_path, dpi=130, bbox_inches='tight')
     plt.close()
-    print("Saved: GRB260207A_emcee_injection.png")
+    print(f"Saved: {output_path}")
+
+def save_injection_plot_cache(chain, lp, chi2_r, output_path=INJECTION_PLOT_CACHE,
+                              max_samples=2000):
+    """Persist enough posterior information to redraw the injection figure.
+
+    This deliberately stores a representative subset rather than an entire
+    potentially very large adaptive MCMC chain. The maximum-likelihood sample
+    is always included.
+    """
+    rng = np.random.default_rng(260207)
+    best_index = int(np.argmax(lp))
+    available = np.delete(np.arange(len(chain)), best_index)
+    draw_count = min(max_samples - 1, len(available))
+    selected = (rng.choice(available, draw_count, replace=False)
+                if draw_count else np.empty(0, dtype=int))
+    selected = np.append(selected, best_index)
+    np.savez_compressed(
+        output_path,
+        model_version=np.array(INJECTION_MODEL_VERSION),
+        parameter_count=np.array(len(NAMES_INJECTION)),
+        chain=np.asarray(chain)[selected],
+        lp=np.asarray(lp)[selected],
+        chi2_r=np.array(chi2_r),
+        p_injection=np.array(P_INJECTION),
+        alpha_rise_injection=np.array(ALPHA_RISE_INJECTION),
+        s_ab=np.array(S_AB),
+    )
+    print(f"Saved reusable injection plotting cache: {output_path}")
+
+def load_injection_plot_cache(input_path=INJECTION_PLOT_CACHE):
+    """Load and validate a cache created by save_injection_plot_cache."""
+    with np.load(input_path) as cache:
+        version = int(cache['model_version'])
+        parameter_count = int(cache['parameter_count'])
+        if version != INJECTION_MODEL_VERSION:
+            raise ValueError(
+                f"cache model version is {version}, expected {INJECTION_MODEL_VERSION}")
+        if parameter_count != len(NAMES_INJECTION):
+            raise ValueError(
+                f"cache has {parameter_count} parameters, expected {len(NAMES_INJECTION)}")
+        return {
+            'chain': cache['chain'].copy(),
+            'lp': cache['lp'].copy(),
+            'chi2_r': float(cache['chi2_r']),
+            'p_injection': float(cache['p_injection']),
+            'alpha_rise_injection': float(cache['alpha_rise_injection']),
+            's_ab': float(cache['s_ab']),
+        }
 
 def save_curved_injection_plot(mask_injection_fit, chain, lp, chi2_r):
     p_best = theta_to_params_curved_injection(chain[np.argmax(lp)])
@@ -927,32 +1062,56 @@ if __name__ == '__main__':
                              f'normal mode uses adaptive stopping')
     parser.add_argument('--curved-injection', action='store_true',
                         help='Also run an opt-in one-parameter curved energy-injection robustness fit.')
+    parser.add_argument(
+        '--presentation-format', action='store_true',
+        help=('Make the injection light curve with no legends and y limits of '
+              '5e-5 to 1e-3 Jy, reusing the saved fit cache when available.'))
     args = parser.parse_args()
 
     rawdata   = np.loadtxt('lc_GRB260207A_cand41148_geo')
-    x_all     = rawdata[:, 0] - trigger_tjd
+    # The light-curve timestamps are cadence starts; model and plot at midtimes.
+    x_all     = rawdata[:, 0] + HALF_C - trigger_tjd
     y_all     = -rawdata[:, 1] / (200 * 0.8 * 0.99)
     yerr_all  =  rawdata[:, 2] / (200 * 0.8 * 0.99)
     zp        = 2416 * 10**(-0.4 * 20.44)
     flux_all  = y_all    * zp
     eflux_all = yerr_all * zp
 
-    # Include 6 h pre-burst for background constraint, out to 12 d post-burst
-    mask_plot = (x_all >= -1.0) & (x_all <= 12.0)
+    # Calibrate an additive photometric noise floor from the full one-day
+    # pre-burst interval, where the source model is a constant background.
+    # This captures cadence-level confusion and subtraction scatter associated
+    # with unresolved sources and background structure in the large TESS pixels.
+    pre = (x_all >= PREBURST_MIN) & (x_all <= PREBURST_MAX)
+    _, _, chi2_formal, dof_bg = fit_constant_background(
+        flux_all[pre], eflux_all[pre])
+    jitter_flux = estimate_additive_jitter(flux_all[pre], eflux_all[pre])
+    jitter_cps = jitter_flux / zp
+    yerr_eff_all = np.sqrt(yerr_all**2 + jitter_cps**2)
+    eflux_eff_all = yerr_eff_all * zp
+    bg_eff, bg_eff_err, chi2_eff, _ = fit_constant_background(
+        flux_all[pre], eflux_eff_all[pre])
+    print("Pre-burst additive-jitter calibration:")
+    print(f"  N={pre.sum()}, interval=[{PREBURST_MIN:.1f}, {PREBURST_MAX:.1f}] d")
+    print(f"  constant background={bg_eff*1e6:.3f} +/- {bg_eff_err*1e6:.3f} uJy")
+    print(f"  formal chi2/dof={chi2_formal:.2f}/{dof_bg}={chi2_formal/dof_bg:.3f}")
+    print(f"  jitter={jitter_flux*1e6:.3f} uJy ({jitter_cps:.3f} counts/s)")
+    print(f"  effective chi2/dof={chi2_eff:.2f}/{dof_bg}={chi2_eff/dof_bg:.3f}")
+
+    # Include 1 d (24 h) pre-burst for the background constraint, out to 12 d post-burst.
+    mask_plot = (x_all >= PREBURST_MIN) & (x_all <= 12.0)
     x_plot  = x_all[mask_plot]
     y_plot  = flux_all[mask_plot]
-    ye_plot = eflux_all[mask_plot]
+    ye_plot = eflux_eff_all[mask_plot]
 
     if args.nomodel:
         # --- Extended mask: first cadence onward through end of data
         mask_ext = (x_all > -HALF_C) & (x_all <= x_all.max())
         xp   = x_all[mask_ext]
         yp   = y_all[mask_ext]
-        yep  = yerr_all[mask_ext]
+        yep  = yerr_eff_all[mask_ext]
 
-        # --- Pre-burst baseline: weighted mean of all t in [-6 h, 0]
-        pre = (x_all >= -1.0) & (x_all <= 0)
-        wt      = 1.0 / yerr_all[pre]**2
+        # --- Pre-burst baseline: weighted mean over the full interval t in [-1 d, 0]
+        wt      = 1.0 / yerr_eff_all[pre]**2
         bkg_val = np.sum(wt * y_all[pre]) / np.sum(wt)
         bkg_err = np.sqrt(1.0 / np.sum(wt))
         print(f"Pre-burst baseline: {bkg_val:.4f} +/- {bkg_err:.4f} cps  (N={pre.sum()})")
@@ -1043,8 +1202,30 @@ if __name__ == '__main__':
         print("Saved: GRB260207A_data_only.png")
         raise SystemExit(0)
 
+    if args.presentation_format:
+        if os.path.exists(INJECTION_PLOT_CACHE):
+            try:
+                plot_cache = load_injection_plot_cache()
+            except (OSError, KeyError, ValueError) as exc:
+                print(f"Cannot reuse {INJECTION_PLOT_CACHE}: {exc}")
+                print("Proceeding with a new fit; its plotting results will be cached.")
+            else:
+                P_INJECTION = plot_cache['p_injection']
+                ALPHA_RISE_INJECTION = plot_cache['alpha_rise_injection']
+                S_AB = plot_cache['s_ab']
+                mask_injection_fit = ((x_plot >= PREBURST_MIN) &
+                                      (x_plot <= INJECTION_FIT_MAX))
+                print(f"Reusing injection fit from {INJECTION_PLOT_CACHE}")
+                save_injection_plot(
+                    mask_injection_fit, plot_cache['chain'], plot_cache['lp'],
+                    plot_cache['chi2_r'], presentation_format=True)
+                raise SystemExit(0)
+        else:
+            print(f"No reusable fit cache found at {INJECTION_PLOT_CACHE}.")
+            print("Proceeding with a new fit; its plotting results will be cached.")
+
     # Fit only through 0.02 d post-burst, keeping pre-burst data for background.
-    mask_fit = (x_plot >= -1.0) & (x_plot <= FS_FIT_MAX)
+    mask_fit = (x_plot >= PREBURST_MIN) & (x_plot <= FS_FIT_MAX)
     xD = x_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
     print(f"N_fit = {len(xD)},  t in [{xD.min()*1440:.2f} min, {xD.max():.3f} d]")
 
@@ -1061,18 +1242,26 @@ if __name__ == '__main__':
     npar = len(NAMES_FS)
     chi2_FS  = -2*np.max(lpFS)
     chi2_rFS = chi2_FS / (N - npar)
-    decay_best = decay_alpha_from_p(P_FIXED)
+    decay_best = decay_alpha_from_p(pFS[4])
 
     print_params('FORWARD SHOCK MODEL', thetaFS, NAMES_FS, qFS,
-                 ['F0 (uJy)', 'tb (min)', 'C_bg (uJy)', 'S_FS'],
-                 [1e6, 1440, 1e6, 1],
+                 ['F0 (uJy)', 'tb (min)', 'C_bg (uJy)', 'S_FS', 'p',
+                  'alpha_rise_FS'],
+                 [1e6, 1440, 1e6, 1, 1, 1],
                  chi2_rFS)
-    print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
-    print(f"  {'rise slope':>24s}:     0.500   (fixed, flux ∝ t^0.5)")
+    print(f"  {'rise slope':>24s}:    {pFS[5]: .3f}   "
+          f"(fitted, flux ∝ t^{pFS[5]:.3f})")
     print(f"  {'decay slope':>24s}:    {-decay_best: .3f}   "
-          f"(fixed by p={P_FIXED:.1f} as -3(p-1)/4)")
-    S_AB = pFS[3]
-    print(f"  {'S_FS for injection':>24s}:     {S_AB:.3f}   (fixed from FS-only fit)")
+          f"(set by best-fit p={pFS[4]:.3f} as -3(p-1)/4)")
+    ALPHA_RISE_INJECTION = fs_rise_posterior_median(chainFS)
+    print(f"  {'rise for injection':>24s}:     {ALPHA_RISE_INJECTION:.3f}   "
+          "(fixed at FS posterior median)")
+    S_AB = fs_smoothness_posterior_median(chainFS)
+    print(f"  {'S_FS for injection':>24s}:     {S_AB:.3f}   "
+          "(fixed at FS posterior median)")
+    P_INJECTION = fs_p_posterior_median(chainFS)
+    print(f"  {'p for injection':>24s}:     {P_INJECTION:.3f}   "
+          "(fixed at FS posterior median)")
 
     # -----------------------------------------------------------
     # Corner plot
@@ -1106,7 +1295,8 @@ if __name__ == '__main__':
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock only: rise t$^{0.5}$, decay t$^{-3(p-1)/4}$', fontsize=10)
+    ax.set_title(f'Forward shock only: rise t$^{{{p_best[5]:.2f}}}$, '
+                 'decay t$^{-3(p-1)/4}$', fontsize=10)
     ax.legend(fontsize=6.5, loc='lower left')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_fit, model_FS, p_best, color)
@@ -1120,7 +1310,8 @@ if __name__ == '__main__':
     # Fit full trigger-frame refreshed forward shock.
     # -----------------------------------------------------------
     injection_fit_max = INJECTION_FIT_MAX
-    mask_injection_fit = (x_plot >= -1.0) & (x_plot <= injection_fit_max)
+    mask_injection_fit = ((x_plot >= PREBURST_MIN) &
+                          (x_plot <= injection_fit_max))
     xI = x_plot[mask_injection_fit]
     yI = y_plot[mask_injection_fit]
     yeI = ye_plot[mask_injection_fit]
@@ -1136,6 +1327,8 @@ if __name__ == '__main__':
     print(f"  {'RS rise alpha':>18s}: {theta0_injection[7]:9.3f}")
     print(f"  {'RS decay alpha':>18s}: {theta0_injection[8]:9.3f}")
     print(f"  {'f_E':>18s}: {theta0_injection[9]:9.3f}")
+    print(f"  {'p (fixed)':>18s}: {P_INJECTION:9.3f}")
+    print(f"  {'rise (fixed)':>18s}: {ALPHA_RISE_INJECTION:9.3f}")
 
     print(f"\nN_injection_fit = {len(xI)},  t in "
           f"[{xI.min()*1440:.2f} min, {xI.max():.3f} d]")
@@ -1157,15 +1350,16 @@ if __name__ == '__main__':
                   'RS decay alpha', 'f_E'],
                  [1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1],
                  chi2_rInjection)
-    print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
+    print(f"  {'p':>24s}:     {P_INJECTION:.3f}   "
+          "(fixed at FS posterior median)")
 
     (F0_FS, tb_FS, C_bg, t_start, t_cross, log10_RE,
      F_RS_cross, alpha_RS_rise, alpha_RS_decay, f_energy) = pInjection
     t_energy_end = t_start + f_energy * (t_cross - t_start)
-    g = energy_flux_index(P_FIXED)
+    g = energy_flux_index(P_INJECTION)
     RE = 10**log10_RE
     e = log10_RE / np.log10(t_energy_end / t_start)
-    alpha_fs = decay_alpha_from_p(P_FIXED)
+    alpha_fs = decay_alpha_from_p(P_INJECTION)
     fs_injection_slope = -alpha_fs + g * e
     print("\nDerived injection diagnostics:")
     print(f"  {'g=(p+3)/4':>24s}: {g:9.3f}")
@@ -1181,6 +1375,8 @@ if __name__ == '__main__':
     print(f"  {'RS rise alpha':>24s}: {alpha_RS_rise:9.3f}   (flux ∝ tau^+alpha)")
     print(f"  {'RS decay alpha':>24s}: {alpha_RS_decay:9.3f}   (flux ∝ tau^-alpha)")
     print(f"  {'RS flux decay slope':>24s}: {-alpha_RS_decay:9.3f}")
+
+    save_injection_plot_cache(chainInjection, lpInjection, chi2_rInjection)
 
     if args.curved_injection:
         theta0_curved = np.append(thetaInjection, 0.0)
@@ -1206,13 +1402,14 @@ if __name__ == '__main__':
                       'RS decay alpha', 'f_E', 'kappa'],
                      [1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1, 1, 1],
                      chi2_rCurved)
-        print(f"  {'p':>24s}:     {P_FIXED:.3f}   (fixed)")
+        print(f"  {'p':>24s}:     {P_INJECTION:.3f}   "
+              "(fixed at FS posterior median)")
 
         (F0_FS_c, tb_FS_c, C_bg_c, t_start_c, t_cross_c,
          log10_RE_c, F_RS_cross_c, alpha_RS_rise_c, alpha_RS_decay_c,
          f_energy_c, kappa_c) = pCurved
         t_energy_end_c = t_start_c + f_energy_c * (t_cross_c - t_start_c)
-        g_c = energy_flux_index(P_FIXED)
+        g_c = energy_flux_index(P_INJECTION)
         RE_c = 10**log10_RE_c
         e_c = log10_RE_c / np.log10(t_energy_end_c / t_start_c)
 
@@ -1238,7 +1435,8 @@ if __name__ == '__main__':
 
     save_corner('INJECTION', chainInjection)
     save_injection_plot(mask_injection_fit, chainInjection, lpInjection,
-                        chi2_rInjection)
+                        chi2_rInjection,
+                        presentation_format=args.presentation_format)
 
     # -----------------------------------------------------------
     # TESS background plot
