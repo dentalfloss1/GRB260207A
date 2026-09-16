@@ -775,11 +775,13 @@ def add_minutes_axis(ax):
     min_ticks = [0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 17000]
     ax_min.set_xticks([m/1440. for m in min_ticks])
     ax_min.set_xticklabels([str(m) for m in min_ticks], fontsize=8)
+    # set_xticks can expand the limits to include off-screen ticks.
+    ax_min.set_xlim(ax.get_xlim())
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
 def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color,
-                   show_legend=True):
-    visible  = (x_plot >= 1e-4) & (x_plot <= 13)
+                   show_legend=True, x_max=13):
+    visible  = (x_plot >= 1e-4) & (x_plot <= x_max)
     pos_fit  = mask_used & visible
     pos_excl = ~mask_used & visible
 
@@ -830,7 +832,7 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color,
             ax_res.scatter(x_resid[low], np.full(low.sum(), -0.96 * ymax),
                            marker='v', s=22 if markersize > 2 else 18,
                            color=color, alpha=alpha, zorder=zorder + 0.2)
-    ax_res.set_xscale('log'); ax_res.set_xlim(1e-4, 13); ax_res.set_ylim(-ymax, ymax)
+    ax_res.set_xscale('log'); ax_res.set_xlim(1e-4, x_max); ax_res.set_ylim(-ymax, ymax)
     ax_res.set_xlabel('Days post-burst', fontsize=11)
     ax_res.set_ylabel('Residuals (σ)', fontsize=10)
     if show_legend:
@@ -880,9 +882,10 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r,
     ax.set_title('Refreshed forward shock with tied reverse-shock component', fontsize=10)
     if not presentation_format:
         ax.legend(fontsize=5.9, loc='best')
-    add_minutes_axis(ax)
+    x_max = INJECTION_FIT_MAX if presentation_format else 13
     plot_residuals(ax_res, mask_injection_fit, model_injection, p_best, color,
-                   show_legend=not presentation_format)
+                   show_legend=not presentation_format, x_max=x_max)
+    add_minutes_axis(ax)
 
     plt.suptitle('GRB 260207A', fontsize=14, y=0.995)
     output_path = ('GRB260207A_emcee_injection_presentation.png'
