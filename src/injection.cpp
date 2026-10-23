@@ -16,18 +16,28 @@ constexpr double MASTERjd = 4078.740327546373 ;
 constexpr double  PREBURSTmin = -1.0 ;
 constexpr double  PREBURSTmax  = 0.0 ;
 
-double pl(double tbins, double f0, double alpha) {
-    return  f0*(std::pow(tbins/t0,alpha)) ;
+double pl(double t, double f0, double alpha) {
+    return  f0*(std::pow(t/t0,alpha)) ;
     }
 
-struct Params {
+double sbpl(double t, double f0, double tbreak,
+            double alpha1,double alpha2, double delta){
+    if (t <= 0.0)
+        return 0.0;
+    return f0 * std::pow((t/tbreak),-alpha1) * std::pow(( (1 + std::pow((t/tbreak),(1/delta)))/2),(alpha1-alpha2)*delta) ;
+    }
+
+struct ParamsSBPL {
     double f0;
-    double alpha;
+    double tbreak;
+    double alpha1;
+    double alpha2;
+    double delta;
     };
     
-double pl_gsl(double t, void* params) {
-    auto* p = static_cast<Params*>(params);
-    return pl(t, p->f0, p->alpha);
+double sbpl_gsl(double t, void* params) {
+    auto* p = static_cast<ParamsSBPL*>(params);
+    return sbpl(t, p->f0, p->tbreak, p->alpha1, p->alpha2, p->delta);
     }
 
 
@@ -73,11 +83,14 @@ int main() {
         }
 
     // Now we have the measured flux values. Everything is in the correct units: time is in days post burst, flux is in Jansky, error is in Jansky.
+    
 
+    // We need data, a model, and a fitter. 
+    // Next step are the models... Plural. We have a forward shock and a forward + injection + reverse model
     double tmin = 1.0 ; 
     double tmax = 10.0 ; 
     Params params{100, 0.2};
-    
+     
     gsl_function F;
     F.function = &pl_gsl;
     F.params = &params; 
