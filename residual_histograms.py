@@ -57,7 +57,7 @@ def fit_internal_model(quick=True):
     mask_fs = ((x_plot >= internal.PREBURST_MIN) &
                (x_plot <= internal.FS_FIT_MAX))
     chain_fs, lp_fs = internal._fit_FS(
-        x_plot[mask_fs], y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
+        internal.as_bin_edges(x_plot[mask_fs]), y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
     theta_fs = best_theta(chain_fs, lp_fs)
     internal.ALPHA_RISE_INTERNAL = internal.fs_rise_posterior_median(chain_fs)
     internal.S_AB = internal.fs_smoothness_posterior_median(chain_fs)
@@ -67,7 +67,7 @@ def fit_internal_model(quick=True):
     mask_internal = ((x_plot >= internal.PREBURST_MIN) &
                      (x_plot <= internal.INTERNAL_FIT_MAX))
     chain_internal, lp_internal = internal._fit_internal(
-        x_plot[mask_internal], y_plot[mask_internal], ye_plot[mask_internal],
+        internal.as_bin_edges(x_plot[mask_internal]), y_plot[mask_internal], ye_plot[mask_internal],
         theta0_internal, quick=quick)
     return best_theta(chain_internal, lp_internal)
 
@@ -81,7 +81,7 @@ def fit_injection_combined(quick=True):
     mask_fs = ((x_plot >= injection.PREBURST_MIN) &
                (x_plot <= injection.FS_FIT_MAX))
     chain_fs, lp_fs = injection._fit_FS(
-        x_plot[mask_fs], y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
+        injection.as_bin_edges(x_plot[mask_fs]), y_plot[mask_fs], ye_plot[mask_fs], quick=quick)
     theta_fs = best_theta(chain_fs, lp_fs)
     injection.ALPHA_RISE_INJECTION = injection.fs_rise_posterior_median(chain_fs)
     injection.S_AB = injection.fs_smoothness_posterior_median(chain_fs)
@@ -91,7 +91,7 @@ def fit_injection_combined(quick=True):
     mask_injection = ((x_plot >= injection.PREBURST_MIN) &
                       (x_plot <= injection.INJECTION_FIT_MAX))
     chain_injection, lp_injection = injection._fit_injection(
-        x_plot[mask_injection], y_plot[mask_injection], ye_plot[mask_injection],
+        injection.as_bin_edges(x_plot[mask_injection]), y_plot[mask_injection], ye_plot[mask_injection],
         theta0_injection, quick=quick)
     return best_theta(chain_injection, lp_injection)
 

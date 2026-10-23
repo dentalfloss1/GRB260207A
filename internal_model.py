@@ -5,9 +5,13 @@ rise slope, and smoothness are then fixed in a full trigger-frame fit:
 
     F_model(t) = F_FS(t) + F_flare(t) + C_bg
 
-The flare has a logistic turn-on/plateau and a curvature tail.  The curvature
-relation uses beta=1 and t0=t_rise, so its fixed exponent is -3.
+The internal component is a double smoothly broken power law in t - tref,
+with fitted rise and decay slopes and a fixed intermediate slope of zero
+(F proportional to time**alpha).
+Both break times are in days after the trigger; tref is the component's onset.
 """
+
+from time_bins import cadence_edges, effective_time, bin_average, model_time_labels
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,8 +37,10 @@ FS_FIT_MAX = 0.02            # days post-burst
 INTERNAL_FIT_MAX = 6.5       # days post-burst for FS+flare fit
 PREBURST_MIN = -1.0          # one day before trigger
 PREBURST_MAX = 0.0           # trigger
-INTERNAL_MODEL_VERSION = 2
-BETA_INTERNAL = 1.0
+INTERNAL_MODEL_VERSION = 5
+ALPHA2_INTERNAL = 0.0       # fixed intermediate (plateau) slope
+S_INTERNAL_1 = 0.1          # fixed logarithmic width of the first transition
+S_INTERNAL_2 = 0.1          # fixed logarithmic width of the second transition
 
 # ---------------------------------------------------------------
 # Base model functions (S passed explicitly)
@@ -42,39 +48,31 @@ BETA_INTERNAL = 1.0
 def sbpl(t, F0, tb, a1, a2, S):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
 
-def windowed_eval(model_fn, t_arr, params):
-    """Integrate near-trigger (t < 5 min) points over 200-s cadence window.
+def model_bin_breaks(model_fn, params):
+    """Split quadrature at the trigger and physical model transitions."""
+    if model_fn.__name__ in ('model_injection', 'model_curved_injection'):
+        start, cross, fraction = params[3], params[4], params[9]
+        return (0.0, params[1], start, start + fraction*(cross-start), cross)
+    if model_fn.__name__ == 'model_internal':
+        return (0.0, params[1], *params[3:6])
+    return (0.0, params[1])
 
-    Pre-burst points whose entire window is at t<=0 are vectorised into a
-    single model call (returns constant background only — no power-law loop).
-    Only the handful of points near t=0 whose window straddles the trigger
-    go through the per-point integration loop.
-    """
-    early = t_arr <= WIN_THRESH          # includes all t < 0
-    out   = np.empty_like(t_arr)
 
-    # --- late points: direct vectorised evaluation
-    if (~early).any():
-        out[~early] = model_fn(t_arr[~early], *params)
+def as_bin_edges(x):
+    """Accept explicit (N, 2) edges; legacy 1-D inputs are cadence midtimes."""
+    x = np.asarray(x, dtype=float)
+    return cadence_edges(x, CADENCE) if x.ndim == 1 else x
 
-    # --- pre-burst: window entirely ≤ 0 → vectorised model call (bg only)
-    pre_burst = early & (t_arr < -HALF_WIN)
-    if pre_burst.any():
-        out[pre_burst] = model_fn(t_arr[pre_burst], *params)
 
-    # --- near-trigger: window straddles or is entirely in t > 0 → integrate
-    near = early & ~pre_burst
-    for i in np.where(near)[0]:
-        tmid  = t_arr[i]
-        ts    = np.linspace(tmid - HALF_WIN, tmid + HALF_WIN, 11)
-        valid = ts > 0
-        if not valid.any():
-            out[i] = model_fn(np.array([tmid]), *params)[0]
-            continue
-        f = np.zeros_like(ts)
-        f[valid] = model_fn(ts[valid], *params)
-        out[i] = np.trapezoid(f, ts) / CADENCE
-    return out
+def windowed_eval(model_fn, edges, params):
+    """Uniform-exposure average over every bin, including the background."""
+    return bin_average(model_fn, as_bin_edges(edges), params,
+                       model_bin_breaks(model_fn, params))
+
+
+def time_labels(model_fn, edges, params):
+    return model_time_labels(model_fn, as_bin_edges(edges), params,
+                             model_bin_breaks(model_fn, params))
 
 def fit_constant_background(flux, flux_err):
     """Weighted constant fit; returns mean, mean error, chi2, and dof."""
@@ -202,77 +200,79 @@ def fs_p_posterior_median(flat_chain):
     return float(np.median(np.asarray(flat_chain)[:, NAMES_FS.index('p')]))
 
 # ===============================================================
-# Internal model — unchanged FS plus piecewise flare and TESS background
+# Internal model — FS plus double smoothly broken power law and TESS background
 # ===============================================================
-NAMES_INTERNAL = [
-    'logF0_FS', 'logTb_FS', 'logC_bg', 't_rise', 'tau_rise', 't_off',
-    'logF_peak',
-]
 PRIOR_INTERNAL = {
     'logF0_FS':  (-6.0, -2.3),
     'logTb_FS':  (-2.523, -1.699),
     'logC_bg':   (-10.0, -4.0),
-    't_rise':    (0.012, 0.050),
-    'tau_rise':  (0.0, 0.020),
-    't_off':     (0.035, 0.080),
-    'logF_peak': (-8.0, -2.0),
+    'tref':      (0.0, 0.050),
+    'tb1':       (0.012, 0.050),
+    'tb2':       (0.035, 0.080),
+    'logF_b1':   (-8.0, -2.0),
+    'alpha1':    (0.0, 10.0),
+    'alpha3':    (-3.0, -0.5),
 }
+NAMES_INTERNAL = list(PRIOR_INTERNAL)
 
-def internal_flare_flux(t, F_peak, t_rise, tau_rise, t_off,
-                        beta=BETA_INTERNAL):
-    """Logistic turn-on followed by a curvature tail with t0=t_rise.
+def internal_flare_flux(t, F_b1, tref, tb1, tb2, alpha1, alpha2, alpha3,
+                        S1=S_INTERNAL_1, S2=S_INTERNAL_2):
+    """Double SBPL, zero at/before onset, normalized to F_b1 at tb1.
 
-    The logistic is normalized at ``t_off`` so the two branches meet exactly
-    at ``F_peak``.  ``tau_rise=0`` is the sharp, unresolved-rise limit.
+    All times are in trigger-frame days. With u=t-tref and bi=tbi-tref,
+    the shape is (u/b1)**alpha1 times two smooth transition factors:
+    [1+(u/bi)**(1/Si)]**((alpha_next-alpha_previous)*Si).
+    Dividing by the shape at u=b1 makes F_b1 the first-break flux, not
+    necessarily the peak. The three asymptotic slopes in u are alpha1,
+    alpha2, alpha3. Evaluate in log space to avoid overflowing powers.
     """
     t = np.asarray(t, dtype=float)
-    if not (0.0 < t_rise < t_off):
-        raise ValueError("Require 0 < t_rise < t_off")
-    if F_peak <= 0.0 or tau_rise < 0.0 or beta <= -2.0:
-        raise ValueError("Invalid flare amplitude or slope")
-    active_rise = (t > 0.0) & (t <= t_off)
-    tail = t > t_off
+    if not np.all(np.isfinite([F_b1, tref, tb1, tb2, alpha1, alpha2,
+                               alpha3, S1, S2])):
+        raise ValueError("Internal-component parameters must be finite")
+    if not (0.0 <= tref < tb1 < tb2):
+        raise ValueError("Require 0 <= tref < tb1 < tb2")
+    if F_b1 <= 0.0 or S1 <= 0.0 or S2 <= 0.0 or alpha1 <= 0.0:
+        raise ValueError("Require positive flux, smoothness, and rise slope")
+    active = t > tref
     flare = np.zeros_like(t)
-    if tau_rise == 0.0:
-        flare[active_rise] = np.where(
-            t[active_rise] < t_rise, 0.0, F_peak)
-    else:
-        def logistic(z):
-            out = np.empty_like(z, dtype=float)
-            nonnegative = z >= 0.0
-            out[nonnegative] = 1.0 / (1.0 + np.exp(-z[nonnegative]))
-            exp_z = np.exp(z[~nonnegative])
-            out[~nonnegative] = exp_z / (1.0 + exp_z)
-            return out
-
-        scale_off = logistic(np.array([(t_off - t_rise) / tau_rise]))[0]
-        flare[active_rise] = F_peak * logistic(
-            (t[active_rise] - t_rise) / tau_rise) / scale_off
-    flare[tail] = F_peak * ((t[tail] - t_rise) /
-                            (t_off - t_rise))**(-(2.0 + beta))
+    log_u = np.log(t[active] - tref)
+    log_b1, log_b2 = np.log([tb1 - tref, tb2 - tref])
+    log_shape = (
+        alpha1 * (log_u - log_b1)
+        + (alpha2 - alpha1) * S1
+        * (np.logaddexp(0.0, (log_u - log_b1) / S1) - np.log(2.0))
+        + (alpha3 - alpha2) * S2
+        * (np.logaddexp(0.0, (log_u - log_b2) / S2)
+           - np.logaddexp(0.0, (log_b1 - log_b2) / S2))
+    )
+    flare[active] = F_b1 * np.exp(log_shape)
     return flare
 
-def model_internal(t, F0_FS, tb_FS, C_bg, t_rise, tau_rise, t_off,
-                   F_peak):
+def model_internal(t, F0_FS, tb_FS, C_bg, tref, tb1, tb2, F_b1,
+                   alpha1, alpha2, alpha3):
     fs = forward_shock_source_flux(t, F0_FS, tb_FS, P_INTERNAL)
     flare = internal_flare_flux(
-        t, F_peak, t_rise, tau_rise, t_off)
+        t, F_b1, tref, tb1, tb2, alpha1, alpha2, alpha3)
     return fs + flare + C_bg
 
 def log_prior_internal(theta):
+    if len(theta) != len(NAMES_INTERNAL):
+        return -np.inf
     for value, (lo, hi) in zip(theta, PRIOR_INTERNAL.values()):
         if not (lo <= value <= hi):
             return -np.inf
-    _, logTb_FS, _, t_rise, _, t_off, _ = theta
-    if not (10**logTb_FS < t_rise < t_off < 0.10):
+    _, logTb_FS, _, tref, tb1, tb2, _, alpha1, _ = theta
+    if not (tref < tb1 < tb2 and 10**logTb_FS < tb1 and alpha1 > 0.0):
         return -np.inf
     return 0.0
 
 def theta_to_params_internal(theta):
-    (logF0_FS, logTb_FS, logC_bg, t_rise, tau_rise, t_off,
-     logF_peak) = theta
+    """Convert fitted parameters and insert the fixed intermediate slope."""
+    (logF0_FS, logTb_FS, logC_bg, tref, tb1, tb2,
+     logF_b1, alpha1, alpha3) = theta
     return (10**logF0_FS, 10**logTb_FS, 10**logC_bg,
-            t_rise, tau_rise, t_off, 10**logF_peak)
+            tref, tb1, tb2, 10**logF_b1, alpha1, ALPHA2_INTERNAL, alpha3)
 
 def log_prob_internal(theta, x, y, yerr):
     lp = log_prior_internal(theta)
@@ -289,24 +289,24 @@ def log_prob_internal(theta, x, y, yerr):
 def theta0_internal_from_fs(theta_FS_best):
     theta0 = np.array([
         theta_FS_best[0], theta_FS_best[1], theta_FS_best[2],
-        0.030, 0.002, 0.046, np.log10(3.5e-4),
+        0.025, 0.035, 0.046, np.log10(3.5e-4), 3.0, -2.0,
     ])
     for j, (lo, hi) in enumerate(PRIOR_INTERNAL.values()):
         theta0[j] = np.clip(theta0[j], lo + 1e-4, hi - 1e-4)
     return theta0
 
 def get_components_internal(t, p):
-    (F0_FS, tb_FS, C_bg, t_rise, tau_rise, t_off, F_peak) = p
+    (F0_FS, tb_FS, C_bg, tref, tb1, tb2, F_b1, alpha1, alpha2, alpha3) = p
     fs = forward_shock_source_flux(t, F0_FS, tb_FS, P_INTERNAL)
-    flare = internal_flare_flux(t, F_peak, t_rise, tau_rise, t_off)
+    flare = internal_flare_flux(t, F_b1, tref, tb1, tb2, alpha1, alpha2, alpha3)
     cbg = np.full_like(t, C_bg)
     return [
         ('Forward shock', fs, '--', 'goldenrod',
          f"tb={tb_FS*1440:.1f} min  decay=-{decay_alpha_from_p(P_INTERNAL):.2f}  "
          f"p={P_INTERNAL:.2f}"),
         ('Internal flare', flare, ':', 'crimson',
-         f"F_p={F_peak*1e6:.2f} uJy  tau_r={tau_rise*1440:.2f} min  "
-         f"tail=-{2+BETA_INTERNAL:.1f}"),
+         f"tref={tref:.3f} d  tb1={tb1:.3f} d  tb2={tb2:.3f} d  "
+         f"slopes={alpha1:+.2f}, {alpha2:+.2f}, {alpha3:+.2f}"),
         ('TESS bg', cbg, '-.', 'mediumseagreen',
          f"C_bg={C_bg*1e6:.2f} uJy"),
     ]
@@ -421,11 +421,12 @@ _CORNER_CFG = {
     ),
     'INTERNAL': dict(
         names=NAMES_INTERNAL,
-        scale=[1e6, 1440, 1e6, 1, 1440, 1, 1e6],
+        scale=[1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1],
         labels=[r'$F_{0,\rm FS}\ (\mu\mathrm{Jy})$', r'$t_{b,\rm FS}\ (\mathrm{min})$',
-                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$t_r\ (\mathrm{d})$',
-                r'$\tau_r\ (\mathrm{min})$', r'$t_{\rm off}\ (\mathrm{d})$',
-                r'$F_p\ (\mu\mathrm{Jy})$'],
+                r'$C_{\rm bg}\ (\mu\mathrm{Jy})$', r'$t_{\rm ref}\ (\mathrm{d})$',
+                r'$t_{b1}\ (\mathrm{d})$', r'$t_{b2}\ (\mathrm{d})$',
+                r'$F_{b1}\ (\mu\mathrm{Jy})$', r'$\alpha_1$',
+                r'$\alpha_3$'],
     ),
 }
 
@@ -466,29 +467,30 @@ def save_corner(tag, flat_chain):
 # ---------------------------------------------------------------
 MODEL_COLOR = {'FS': 'royalblue', 'INTERNAL': 'navy'}
 
-def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
+def add_data_to_ax(ax, mask_used, alpha_excl=0.4, model_fn=None, params=None):
+    times = x_plot if model_fn is None else time_labels(model_fn, x_plot, params)
     pos          = y_plot > 0
     fitted_pos   = mask_used & pos
     excluded_pos = ~mask_used & pos & (x_plot < 13)
     fitted_nonpos = mask_used & ~pos
     excluded_nonpos = ~mask_used & ~pos & (x_plot < 13)
     if excluded_pos.any():
-        ax.errorbar(x_plot[excluded_pos], y_plot[excluded_pos],
+        ax.errorbar(times[excluded_pos], y_plot[excluded_pos],
                     yerr=ye_plot[excluded_pos], fmt='.', color='gray',
                     markersize=2, elinewidth=0.3, alpha=alpha_excl,
                     capsize=0, zorder=1.5, label='Excluded')
-    ax.errorbar(x_plot[fitted_pos], y_plot[fitted_pos],
+    ax.errorbar(times[fitted_pos], y_plot[fitted_pos],
                 yerr=ye_plot[fitted_pos], fmt='.', color='black',
                 markersize=3, elinewidth=0.4, alpha=0.8, capsize=0,
                 zorder=2, label='Fitted')
     floor_trans = blended_transform_factory(ax.transData, ax.transAxes)
     if excluded_nonpos.any():
-        ax.scatter(x_plot[excluded_nonpos], np.full(excluded_nonpos.sum(), 0.025),
+        ax.scatter(times[excluded_nonpos], np.full(excluded_nonpos.sum(), 0.025),
                    marker='v', s=18, color='gray', alpha=alpha_excl,
                    transform=floor_trans, clip_on=False, zorder=3,
                    label='Excluded <= 0')
     if fitted_nonpos.any():
-        ax.scatter(x_plot[fitted_nonpos], np.full(fitted_nonpos.sum(), 0.025),
+        ax.scatter(times[fitted_nonpos], np.full(fitted_nonpos.sum(), 0.025),
                    marker='v', s=22, color='black', alpha=0.8,
                    transform=floor_trans, clip_on=False, zorder=4,
                    label='Fitted <= 0')
@@ -513,6 +515,7 @@ def add_minutes_axis(ax):
     ax_min.set_xlabel('Minutes post-burst', fontsize=10)
 
 def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
+    times = time_labels(model_fn, x_plot, params_best)
     visible  = (x_plot >= 1e-4) & (x_plot <= 13)
     pos_fit  = mask_used & visible
     pos_excl = ~mask_used & visible
@@ -529,12 +532,12 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color):
     ]:
         if not mask.any():
             continue
-        ymod = model_fn(x_plot[mask], *params_best)
+        ymod = windowed_eval(model_fn, as_bin_edges(x_plot[mask]), params_best)
         resid = (y_plot[mask] - ymod) / ye_plot[mask]
         finite = np.isfinite(resid)
         if not finite.any():
             continue
-        x_resid = x_plot[mask][finite]
+        x_resid = times[mask][finite]
         resid = resid[finite]
         all_resid.append(resid)
         groups.append((x_resid, resid, color, markersize, alpha, zorder, label))
@@ -579,7 +582,7 @@ def save_internal_plot(mask_internal_fit, chain, lp, chi2_r):
         2, 1, figsize=(8, 9),
         gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
 
-    add_data_to_ax(ax, mask_internal_fit)
+    add_data_to_ax(ax, mask_internal_fit, model_fn=model_internal, params=p_best)
 
     rng = np.random.default_rng(52)
     for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
@@ -602,7 +605,7 @@ def save_internal_plot(mask_internal_fit, chain, lp, chi2_r):
     format_main_ax(ax)
     ax.tick_params(labelbottom=False)
     ax.set_ylabel('Flux density (Jy)', fontsize=11)
-    ax.set_title('Forward shock plus piecewise internal flare', fontsize=10)
+    ax.set_title('Forward shock plus double-SBPL internal component', fontsize=10)
     ax.legend(fontsize=6.2, loc='best')
     add_minutes_axis(ax)
     plot_residuals(ax_res, mask_internal_fit, model_internal, p_best, color)
@@ -682,8 +685,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     rawdata   = np.loadtxt('lc_GRB260207A_cand41148_geo')
-    # The light-curve timestamps are cadence starts; model and plot at midtimes.
-    x_all     = rawdata[:, 0] + HALF_C - trigger_tjd
+    # Light-curve timestamps are cadence starts; retain both exposure edges.
+    starts = rawdata[:, 0] - trigger_tjd
+    edges_all = np.column_stack((starts, starts + CADENCE))
+    x_all = edges_all.mean(axis=1)
     y_all     = -rawdata[:, 1] / (200 * 0.8 * 0.99)
     yerr_all  =  rawdata[:, 2] / (200 * 0.8 * 0.99)
     zp        = 2416 * 10**(-0.4 * 20.44)
@@ -713,6 +718,7 @@ if __name__ == '__main__':
     # Include 1 d (24 h) pre-burst for the background constraint, out to 12 d post-burst.
     mask_plot = (x_all >= PREBURST_MIN) & (x_all <= 12.0)
     x_plot  = x_all[mask_plot]
+    edges_plot = edges_all[mask_plot]
     y_plot  = flux_all[mask_plot]
     ye_plot = eflux_eff_all[mask_plot]
 
@@ -817,7 +823,7 @@ if __name__ == '__main__':
 
     # Fit only through 0.02 d post-burst, keeping pre-burst data for background.
     mask_fit = (x_plot >= PREBURST_MIN) & (x_plot <= FS_FIT_MAX)
-    xD = x_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
+    xD = edges_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
     print(f"N_fit = {len(xD)},  t in [{xD.min()*1440:.2f} min, {xD.max():.3f} d]")
 
     mode_str = "quick" if args.quick else "adaptive (convergence-based)"
@@ -869,7 +875,7 @@ if __name__ == '__main__':
         2, 1, figsize=(8, 9),
         gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
 
-    add_data_to_ax(ax, mask_fit)
+    add_data_to_ax(ax, mask_fit, model_fn=model_FS, params=p_best)
 
     rng = np.random.default_rng(42)
     for i in rng.choice(len(chainFS), min(200, len(chainFS)), replace=False):
@@ -896,11 +902,11 @@ if __name__ == '__main__':
     plt.close()
     print("Saved: GRB260207A_emcee_forward_shock.png")
 
-    # Fit the full trigger-frame forward shock plus piecewise flare.
+    # Fit the full trigger-frame forward shock plus double-SBPL component.
     theta0_internal = theta0_internal_from_fs(thetaFS)
     mask_internal_fit = ((x_plot >= PREBURST_MIN) &
                          (x_plot <= INTERNAL_FIT_MAX))
-    xI = x_plot[mask_internal_fit]
+    xI = edges_plot[mask_internal_fit]
     yI = y_plot[mask_internal_fit]
     yeI = ye_plot[mask_internal_fit]
     print(f"\nN_internal_fit = {len(xI)},  t in "
@@ -917,16 +923,14 @@ if __name__ == '__main__':
     print_params('FORWARD SHOCK + INTERNAL FLARE MODEL',
                  thetaInternal, NAMES_INTERNAL, qInternal,
                  ['F0_FS (uJy)', 'tb_FS (min)', 'C_bg (uJy)',
-                  't_rise (d)', 'tau_rise (min)', 't_off (d)',
-                  'F_peak (uJy)'],
-                 [1e6, 1440, 1e6, 1, 1440, 1, 1e6],
+                  'tref (d)', 'tb1 (d)', 'tb2 (d)',
+                  'F_b1 (uJy)', 'alpha1', 'alpha3'],
+                 [1e6, 1440, 1e6, 1, 1, 1, 1e6, 1, 1],
                  chi2_rInternal)
     print(f"  {'p':>24s}: {P_INTERNAL:9.3f}   (fixed at FS posterior median)")
-    print(f"  {'beta':>24s}: {BETA_INTERNAL:9.3f}   (fixed)")
-    print(f"  {'curvature slope':>24s}: {-(2+BETA_INTERNAL):9.3f}")
-    print(f"  {'rise timescale (min)':>24s}: {pInternal[4]*1440:9.3f}")
-    print(f"  {'t_off-t_r (min)':>24s}: "
-          f"{(pInternal[5]-pInternal[3])*1440:9.3f}")
+    print(f"  {'alpha2':>24s}: {ALPHA2_INTERNAL:9.3f}   (fixed)")
+    print(f"  {'S1':>24s}: {S_INTERNAL_1:9.3f}   (fixed)")
+    print(f"  {'S2':>24s}: {S_INTERNAL_2:9.3f}   (fixed)")
 
     save_corner('INTERNAL', chainInternal)
     save_internal_plot(mask_internal_fit, chainInternal, lpInternal,

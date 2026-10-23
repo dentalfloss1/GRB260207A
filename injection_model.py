@@ -21,6 +21,8 @@ import os
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
+from time_bins import cadence_edges, effective_time, bin_average, model_time_labels
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.transforms import blended_transform_factory
@@ -45,7 +47,7 @@ FS_FIT_MAX = 0.02            # days post-burst
 INJECTION_FIT_MAX = 6.5      # days post-burst for FS+injection+RS fit
 PREBURST_MIN = -1.0          # one day before trigger
 PREBURST_MAX = 0.0           # trigger
-INJECTION_MODEL_VERSION = 17  # Bump when cached fit coordinates/data choices change.
+INJECTION_MODEL_VERSION = 18  # Bump when cached fit coordinates/data choices change.
 INJECTION_PLOT_CACHE = 'GRB260207A_injection_fit_cache.npz'
 
 # ---------------------------------------------------------------
@@ -54,39 +56,31 @@ INJECTION_PLOT_CACHE = 'GRB260207A_injection_fit_cache.npz'
 def sbpl(t, F0, tb, a1, a2, S):
     return F0 * (t/tb)**(-a1) * (0.5*(1 + (t/tb)**(1/S)))**(-(a2-a1)*S)
 
-def windowed_eval(model_fn, t_arr, params):
-    """Integrate near-trigger (t < 5 min) points over 200-s cadence window.
+def model_bin_breaks(model_fn, params):
+    """Split quadrature at the trigger and physical model transitions."""
+    if model_fn.__name__ in ('model_injection', 'model_curved_injection'):
+        start, cross, fraction = params[3], params[4], params[9]
+        return (0.0, params[1], start, start + fraction*(cross-start), cross)
+    if model_fn.__name__ == 'model_internal':
+        return (0.0, params[1], *params[3:6])
+    return (0.0, params[1])
 
-    Pre-burst points whose entire window is at t<=0 are vectorised into a
-    single model call (returns constant background only — no power-law loop).
-    Only the handful of points near t=0 whose window straddles the trigger
-    go through the per-point integration loop.
-    """
-    early = t_arr <= WIN_THRESH          # includes all t < 0
-    out   = np.empty_like(t_arr)
 
-    # --- late points: direct vectorised evaluation
-    if (~early).any():
-        out[~early] = model_fn(t_arr[~early], *params)
+def as_bin_edges(x):
+    """Accept explicit (N, 2) edges; legacy 1-D inputs are cadence midtimes."""
+    x = np.asarray(x, dtype=float)
+    return cadence_edges(x, CADENCE) if x.ndim == 1 else x
 
-    # --- pre-burst: window entirely ≤ 0 → vectorised model call (bg only)
-    pre_burst = early & (t_arr < -HALF_WIN)
-    if pre_burst.any():
-        out[pre_burst] = model_fn(t_arr[pre_burst], *params)
 
-    # --- near-trigger: window straddles or is entirely in t > 0 → integrate
-    near = early & ~pre_burst
-    for i in np.where(near)[0]:
-        tmid  = t_arr[i]
-        ts    = np.linspace(tmid - HALF_WIN, tmid + HALF_WIN, 11)
-        valid = ts > 0
-        if not valid.any():
-            out[i] = model_fn(np.array([tmid]), *params)[0]
-            continue
-        f = np.zeros_like(ts)
-        f[valid] = model_fn(ts[valid], *params)
-        out[i] = np.trapezoid(f, ts) / CADENCE
-    return out
+def windowed_eval(model_fn, edges, params):
+    """Uniform-exposure average over every bin, including the background."""
+    return bin_average(model_fn, as_bin_edges(edges), params,
+                       model_bin_breaks(model_fn, params))
+
+
+def time_labels(model_fn, edges, params):
+    return model_time_labels(model_fn, as_bin_edges(edges), params,
+                             model_bin_breaks(model_fn, params))
 
 def fit_constant_background(flux, flux_err):
     """Weighted constant fit; returns mean, mean error, chi2, and dof."""
@@ -731,29 +725,30 @@ MODEL_COLOR = {
     'CURVED_INJECTION': 'darkviolet',
 }
 
-def add_data_to_ax(ax, mask_used, alpha_excl=0.4):
+def add_data_to_ax(ax, mask_used, alpha_excl=0.4, model_fn=None, params=None):
+    times = x_plot if model_fn is None else time_labels(model_fn, x_plot, params)
     pos          = y_plot > 0
     fitted_pos   = mask_used & pos
     excluded_pos = ~mask_used & pos & (x_plot < 13)
     fitted_nonpos = mask_used & ~pos
     excluded_nonpos = ~mask_used & ~pos & (x_plot < 13)
     if excluded_pos.any():
-        ax.errorbar(x_plot[excluded_pos], y_plot[excluded_pos],
+        ax.errorbar(times[excluded_pos], y_plot[excluded_pos],
                     yerr=ye_plot[excluded_pos], fmt='.', color='gray',
                     markersize=2, elinewidth=0.3, alpha=alpha_excl,
                     capsize=0, zorder=1.5, label='Excluded')
-    ax.errorbar(x_plot[fitted_pos], y_plot[fitted_pos],
+    ax.errorbar(times[fitted_pos], y_plot[fitted_pos],
                 yerr=ye_plot[fitted_pos], fmt='.', color='black',
                 markersize=3, elinewidth=0.4, alpha=0.8, capsize=0,
                 zorder=2, label='Fitted')
     floor_trans = blended_transform_factory(ax.transData, ax.transAxes)
     if excluded_nonpos.any():
-        ax.scatter(x_plot[excluded_nonpos], np.full(excluded_nonpos.sum(), 0.025),
+        ax.scatter(times[excluded_nonpos], np.full(excluded_nonpos.sum(), 0.025),
                    marker='v', s=18, color='gray', alpha=alpha_excl,
                    transform=floor_trans, clip_on=False, zorder=3,
                    label='Excluded <= 0')
     if fitted_nonpos.any():
-        ax.scatter(x_plot[fitted_nonpos], np.full(fitted_nonpos.sum(), 0.025),
+        ax.scatter(times[fitted_nonpos], np.full(fitted_nonpos.sum(), 0.025),
                    marker='v', s=22, color='black', alpha=0.8,
                    transform=floor_trans, clip_on=False, zorder=4,
                    label='Fitted <= 0')
@@ -781,6 +776,7 @@ def add_minutes_axis(ax):
 
 def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color,
                    show_legend=True, x_max=13):
+    times = time_labels(model_fn, x_plot, params_best)
     visible  = (x_plot >= 1e-4) & (x_plot <= x_max)
     pos_fit  = mask_used & visible
     pos_excl = ~mask_used & visible
@@ -797,12 +793,12 @@ def plot_residuals(ax_res, mask_used, model_fn, params_best, line_color,
     ]:
         if not mask.any():
             continue
-        ymod = model_fn(x_plot[mask], *params_best)
+        ymod = windowed_eval(model_fn, as_bin_edges(x_plot[mask]), params_best)
         resid = (y_plot[mask] - ymod) / ye_plot[mask]
         finite = np.isfinite(resid)
         if not finite.any():
             continue
-        x_resid = x_plot[mask][finite]
+        x_resid = times[mask][finite]
         resid = resid[finite]
         all_resid.append(resid)
         groups.append((x_resid, resid, color, markersize, alpha, zorder, label))
@@ -849,7 +845,7 @@ def save_injection_plot(mask_injection_fit, chain, lp, chi2_r,
         2, 1, figsize=(8, 9), sharex=True,
         gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.0})
 
-    add_data_to_ax(ax, mask_injection_fit)
+    add_data_to_ax(ax, mask_injection_fit, model_fn=model_injection, params=p_best)
 
     rng = np.random.default_rng(62)
     for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
@@ -955,7 +951,7 @@ def save_curved_injection_plot(mask_injection_fit, chain, lp, chi2_r):
         2, 1, figsize=(8, 9), sharex=True,
         gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.0})
 
-    add_data_to_ax(ax, mask_injection_fit)
+    add_data_to_ax(ax, mask_injection_fit, model_fn=model_curved_injection, params=p_best)
 
     rng = np.random.default_rng(63)
     for i in rng.choice(len(chain), min(200, len(chain)), replace=False):
@@ -1075,8 +1071,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     rawdata   = np.loadtxt('lc_GRB260207A_cand41148_geo')
-    # The light-curve timestamps are cadence starts; model and plot at midtimes.
-    x_all     = rawdata[:, 0] + HALF_C - trigger_tjd
+    # Light-curve timestamps are cadence starts; retain both exposure edges.
+    starts = rawdata[:, 0] - trigger_tjd
+    edges_all = np.column_stack((starts, starts + CADENCE))
+    x_all = edges_all.mean(axis=1)
     y_all     = -rawdata[:, 1] / (200 * 0.8 * 0.99)
     yerr_all  =  rawdata[:, 2] / (200 * 0.8 * 0.99)
     zp        = 2416 * 10**(-0.4 * 20.44)
@@ -1106,6 +1104,7 @@ if __name__ == '__main__':
     # Include 1 d (24 h) pre-burst for the background constraint, out to 12 d post-burst.
     mask_plot = (x_all >= PREBURST_MIN) & (x_all <= 12.0)
     x_plot  = x_all[mask_plot]
+    edges_plot = edges_all[mask_plot]
     y_plot  = flux_all[mask_plot]
     ye_plot = eflux_eff_all[mask_plot]
 
@@ -1241,7 +1240,7 @@ if __name__ == '__main__':
 
     # Fit only through 0.02 d post-burst, keeping pre-burst data for background.
     mask_fit = (x_plot >= PREBURST_MIN) & (x_plot <= FS_FIT_MAX)
-    xD = x_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
+    xD = edges_plot[mask_fit]; yD = y_plot[mask_fit]; yeD = ye_plot[mask_fit]
     print(f"N_fit = {len(xD)},  t in [{xD.min()*1440:.2f} min, {xD.max():.3f} d]")
 
     mode_str = "quick" if args.quick else "adaptive (convergence-based)"
@@ -1294,7 +1293,7 @@ if __name__ == '__main__':
         2, 1, figsize=(8, 9),
         gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.05})
 
-    add_data_to_ax(ax, mask_fit)
+    add_data_to_ax(ax, mask_fit, model_fn=model_FS, params=p_best)
 
     rng = np.random.default_rng(42)
     for i in rng.choice(len(chainFS), min(200, len(chainFS)), replace=False):
@@ -1327,7 +1326,7 @@ if __name__ == '__main__':
     injection_fit_max = INJECTION_FIT_MAX
     mask_injection_fit = ((x_plot >= PREBURST_MIN) &
                           (x_plot <= injection_fit_max))
-    xI = x_plot[mask_injection_fit]
+    xI = edges_plot[mask_injection_fit]
     yI = y_plot[mask_injection_fit]
     yeI = ye_plot[mask_injection_fit]
     theta0_injection = theta0_injection_from_fs(thetaFS)
