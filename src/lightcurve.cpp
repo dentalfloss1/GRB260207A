@@ -41,10 +41,13 @@ LightCurve read_lightcurve(const std::string& filename) {
   for (size_t i=0;i<time.size();i++){
       // These are the start times in days post burst. We'll feed this into the model and compute stop times.
       // No more doing midtimes because that becomes inaccurate for flux that changes inside of the observation.
+
+      // IN DAYS! 
       time[i] = time[i] - TRIGGERtjd ; 
       // cts to cts_per_sec accounting for cosmic ray and efficiency, then to Jansky
-      flux[i] = 1.6110051544201104e-05*(flux[i]/(cadence*0.8*0.99*86400.0)) ;
-      err[i] = 1.6110051544201104e-05*(err[i]/(cadence*0.8*0.99*86400.0)) ; 
+      // NEVERMIND, using total counts
+      // flux[i] = 1.6110051544201104e-05*(flux[i]/(cadence*0.8*0.99*86400.0)) ;
+      // err[i] = 1.6110051544201104e-05*(err[i]/(cadence*0.8*0.99*86400.0)) ; 
       }
 
   return LightCurve {time, flux, err};
