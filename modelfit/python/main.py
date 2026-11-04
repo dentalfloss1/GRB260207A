@@ -83,21 +83,22 @@ if __name__=="__main__":
     fsfitter = Fit(list(PRIOR_FS.keys()), PRIOR_FS, fs_model, subtbins, ydata, yerr)
     fsfitter.run(theta0_FS)
     flat_samples = fsfitter.samples()
+    bestfit = fsfitter.bestfit()
     fig = corner.corner(flat_samples, labels=list(PRIOR_FS.keys()))
     plt.savefig("corner.png")
     plt.close()
     fig = plt.figure()
     plt.errorbar(subtbins+CADENCE/2,ydata*TOT_CTS_TO_JY,xerr=CADENCE/2,yerr=yerr*TOT_CTS_TO_JY,ls='none')
     plt.errorbar(subtbins+CADENCE/2,fs_model(subtbins+CADENCE/2,bestfit)*TOT_CTS_TO_JY,xerr=CADENCE/2,ls='none',marker='s',color='red')
-    # inds = np.random.randint(len(flat_samples),size=100)
-   #  x0 = np.geomspace(1e-4, subtbins.max(),1000)
-   #  for ind in inds:
-   #      sample = flat_samples[ind]
-    #     plt.plot(x0, fs_model(x0,sample)*TOT_CTS_TO_JY, "C1", alpha=0.1)
+    inds = np.random.randint(len(flat_samples),size=100)
+    x0 = np.geomspace(1e-4, subtbins.max(),1000)
+    for ind in inds:
+        sample = flat_samples[ind]
+        plt.plot(x0, fs_model(x0,sample)*TOT_CTS_TO_JY, "C1", alpha=0.1)
 
     
     ax = plt.gca()
-    ax.set_xscale('log')
+    ax.set_xscale('symlog', linthresh=2e-3)
     ax.set_yscale('log')
     plt.savefig("lightcurve.png")
     plt.close()
