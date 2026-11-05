@@ -76,7 +76,7 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
   auto o = out.mutable_unchecked<1>();
 
   fwd f1(logF0, logtb, k, p);
-  rev f2(logF0rev, logtbrev, k, p, a1, a2);
+  rev f2(logF0rev, std::log10(std::pow(10, logtbrev) - tinj), k, p, a1, a2);
 
   for (py::ssize_t i=0; i<n; ++i){
     const double t_start = tin(i) ; 
@@ -90,7 +90,8 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
         double frev = 0;
         if (ts > tinj) {
           inj=std::pow(10,logEinj);
-          frev  = f2(ts);
+          frev  = f2(ts-tinj);
+        }
         const double fl = f1(ts)*inj+frev;
         sum += fl; 
         lo = std::fmin(lo,fl);
