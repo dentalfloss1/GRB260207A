@@ -65,7 +65,9 @@ namespace {
 // forcecast + c_style: any float/int array or list gets converted to a contiguous double array
 using darray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
-py::array_t<double> model(darray t, double k, double logF0, double logtb, double p, double a1, double a2, double tinj, double Einj){
+py::array_t<double> model(darray t, double k, double logF0, double logtb, double p,
+                          double logF0rev, double logtbrev, double a1, double a2, 
+                          double tinj, double Einj){
   auto tin = t.unchecked<1>();   //throws if t is not 1-D
   const py::ssize_t n = tin.shape(0);
 
@@ -73,7 +75,7 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
   auto o = out.mutable_unchecked<1>();
 
   fwd f1(logF0, logtb, k, p);
-  rev f2(logF0, logtb, k, p, a1, a2);
+  rev f2(logF0rev, logtbrev, k, p, a1, a2);
 
   for (py::ssize_t i=0; i<n; ++i){
     const double t_start = tin(i) ; 
@@ -99,7 +101,9 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
 
 PYBIND11_MODULE(lcmodel, m){
   m.doc() = "Light curve model";
-  m.def("injection", &model, "t"_a, "k"_a, "logf0"_a, "logtb"_a, "p"_a,"a1"_a, "a2"_a, "tinj"_a, "Einj"_a,
+  m.def("injection", &model, "t"_a, "k"_a, "logf0"_a, "logtb"_a, 
+        "p"_a,"logF0rev"_a,"logtbrev"_a,"a1"_a, 
+        "a2"_a, "tinj"_a, "Einj"_a,
         "Compute model flux as times t");
   }
     
