@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from astropy.time import Time
 import corner
 import lcmodel
+from jitter import fit_jitter
 
 CADENCE = 200.0/60.0/60.0/24.0
 TRIGGER = Time("2026-02-07 05:42:33.65").jd - 2457000
@@ -71,19 +72,37 @@ class Fit:
             print(name, bfparams[i])
         return 0 
          
-    
+def get_preburst_fluxoff(f_i, stat_i, jitter):
+    w_i = (1 / (stat_i**2 + jitter**2))
+    return np.average(f_i, weights=w_i)
+   
+def print_red_chi2(data, model, err, dof):
+    print("Red. Chi2:", (1/dof) * np.sum((data - model)**2 / (err**2)))
 
 if __name__=="__main__":
     data = np.loadtxt("lc_GRB260207A_cand41148_geo")
     tbins = data[:,0] - TRIGGER
     tends = tbins + CADENCE
+
+    # Pre-trigger, get jitter 
+    subtbins = tbins[(tbins > -0.5) & (tends < 0)]
+    ydata = -data[:,1][(tbins >-0.5) & (tends < 0 )]
+    yerr = data[:,2][(tbins > -0.5) & (tends < 0)]
+    
+    jitter = fit_jitter(ydata, yerr)
+    flux_offset = get_preburst_fluxoff(ydata, yerr, jitter)
+    
+    # forward shock
     subtbins = tbins[(tends > 0) & (tbins < FORWARDSTOP)]
-    ydata = -data[:,1][(tends >0) & (tbins < FORWARDSTOP)]
-    yerr = data[:,2][(tends > 0) & (tbins < FORWARDSTOP)]
+    ydata = -data[:,1][(tends >0) & (tbins < FORWARDSTOP)] - flux_offset
+    yerr = np.sqrt(data[:,2][(tends > 0) & (tbins < FORWARDSTOP)]**2 + jitter**2)
     fsfitter = Fit(list(PRIOR_FS.keys()), PRIOR_FS, fs_model, subtbins, ydata, yerr)
     fsfitter.run(theta0_FS)
     flat_samples = fsfitter.samples()
     bestfit = fsfitter.bestfit()
+    
+    print_red_chi2(ydata, fs_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))  
+
     fig = corner.corner(flat_samples, labels=list(PRIOR_FS.keys()))
     plt.savefig("corner.png")
     plt.close()
