@@ -48,6 +48,7 @@ namespace {
       lntb = logtb * LN10;
       invS = 1.0 / S;
       c    = (a2 - a1) * S;
+      this->a1=a1;
 
     }
     double operator()(double t) const {
@@ -67,7 +68,7 @@ using darray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
 py::array_t<double> model(darray t, double k, double logF0, double logtb, double p,
                           double logF0rev, double logtbrev, double a1, double a2, 
-                          double tinj, double Einj){
+                          double tinj, double logEinj){
   auto tin = t.unchecked<1>();   //throws if t is not 1-D
   const py::ssize_t n = tin.shape(0);
 
@@ -85,9 +86,12 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
       double sum = 0.0, lo = INFINITY, hi = -INFINITY;
       for (int s=0; s<BLOCK_LEN; ++s){
         const double ts = t_start + (b*BLOCK_LEN + s + 0.5)*SUB_DT;
-        if ts > tinj:
-            inj=1*Einj;
-        const double fl = f1(ts)*(1+Einj)+f2(ts);
+        double inj = 1;
+        double frev = 0;
+        if (ts > tinj) {
+          inj=std::pow(10,logEinj);
+          frev  = f2(ts);
+        const double fl = f1(ts)*inj+frev;
         sum += fl; 
         lo = std::fmin(lo,fl);
         hi = std::fmax(hi, fl);
@@ -99,11 +103,10 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
   return out;
   }
 
-PYBIND11_MODULE(lcmodel, m){
-  m.doc() = "Light curve model";
+void register_injection(py::module_ &m){
   m.def("injection", &model, "t"_a, "k"_a, "logf0"_a, "logtb"_a, 
         "p"_a,"logF0rev"_a,"logtbrev"_a,"a1"_a, 
-        "a2"_a, "tinj"_a, "Einj"_a,
+        "a2"_a, "tinj"_a, "logEinj"_a,
         "Compute model flux as times t");
   }
-    
+

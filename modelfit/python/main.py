@@ -19,11 +19,22 @@ PRIOR_FS = {
     'p':   (1.5, 3),
 }
 
+PRIOR_INJ = {
+    'logF0rev': (1.0, 5.0),
+    'logtbrev': (-1.6,-1.2),
+    'a1': (-3,-1),
+    'a2': (1,3),
+    'tinj': (0.008, 0.02),
+    'logEinj': (0,6)
+}
+
 theta0_FS = np.array([np.log10(1e3), np.log10(0.01), 2.2])
+theta0_INJ = np.array([np.log10(1e3), np.log10(0.04), -1.5,
+                       2, 0.01, 2])
 
 def fs_model(t, theta):
     return lcmodel.forwardshock(t, K, *theta)
-
+    
 class Fit:
     def __init__(self, names, priors, model, t, y, yerr):
         self.names = names
@@ -122,4 +133,36 @@ if __name__=="__main__":
     plt.savefig("lightcurve.png")
     plt.close()
 
+    # full evolution 
+    bestfwd = bestfit
+    def inj_model(t, theta):
+        logF0, logtb, p = bestfwd
+        return lcmodel.injection(t, K, logF0, logtb, p,  *theta)
+    subtbins = tbins[(tends > 0) & (tbins < 1)]
+    ydata = -data[:,1][(tends >0) & (tbins < 1)] - flux_offset
+    yerr = np.sqrt(data[:,2][(tends > 0) & (tbins < 1)]**2 + jitter**2)
+    injfitter = Fit(list(PRIOR_INJ.keys()), PRIOR_INJ, inj_model, subtbins, ydata, yerr)
+    injfitter.run(theta0_INJ)
+    flat_samples = injfitter.samples()
+    bestfit = injfitter.bestfit()
+    
+    print_red_chi2(ydata, inj_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))  
 
+    fig = corner.corner(flat_samples, labels=list(PRIOR_INJ.keys()))
+    plt.savefig("injcorner.png")
+    plt.close()
+    fig = plt.figure()
+    plt.errorbar(subtbins+CADENCE/2,ydata*TOT_CTS_TO_JY,xerr=CADENCE/2,yerr=yerr*TOT_CTS_TO_JY,ls='none')
+    plt.errorbar(subtbins+CADENCE/2,inj_model(subtbins+CADENCE/2,bestfit)*TOT_CTS_TO_JY,xerr=CADENCE/2,ls='none',marker='s',color='red')
+    inds = np.random.randint(len(flat_samples),size=100)
+    x0 = np.geomspace(1e-4, subtbins.max(),1000)
+    for ind in inds:
+        sample = flat_samples[ind]
+        plt.plot(x0, inj_model(x0,sample)*TOT_CTS_TO_JY, "C1", alpha=0.1)
+
+    
+    ax = plt.gca()
+    ax.set_xscale('symlog', linthresh=2e-3)
+    ax.set_yscale('log')
+    plt.savefig("injlightcurve.png")
+    plt.close()

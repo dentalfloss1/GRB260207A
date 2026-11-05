@@ -75,9 +75,9 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
   return out;
   }
 
-PYBIND11_MODULE(lcmodel, m){
-  m.doc() = "Light curve model";
+void register_forwardshock(py::module_ &m){
   m.def("forwardshock", &model, "t"_a, "k"_a, "logf0"_a, "logtb"_a, "p"_a,
         "Compute model flux as times t");
-  }
+        }
+
     
