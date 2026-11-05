@@ -1,10 +1,9 @@
 import numpy as np 
 import emcee
-import matplotlib.pyplot as plt
 from astropy.time import Time
-import corner
 import lcmodel
 from jitter import fit_jitter
+from plotting import save_corner, save_lightcurve
 
 CADENCE = 200.0/60.0/60.0/24.0
 TRIGGER = Time("2026-02-07 05:42:33.65").jd - 2457000
@@ -20,10 +19,10 @@ PRIOR_FS = {
 }
 
 PRIOR_INJ = {
-    'logF0rev': (1.0, 5.0),
+    'logF0rev': (0, 1),
     'logtbrev': (-1.6,-1.2),
     'a1': (-3,-1),
-    'a2': (1,3),
+    'a2': (1.5,3),
     'tinj': (0.008, 0.02),
     'logEinj': (0,6)
 }
@@ -88,7 +87,9 @@ def get_preburst_fluxoff(f_i, stat_i, jitter):
     return np.average(f_i, weights=w_i)
    
 def print_red_chi2(data, model, err, dof):
-    print("Red. Chi2:", (1/dof) * np.sum((data - model)**2 / (err**2)))
+    chi2_r = (1/dof) * np.sum((data - model)**2 / (err**2))
+    print("Red. Chi2:", chi2_r)
+    return chi2_r
 
 if __name__=="__main__":
     data = np.loadtxt("lc_GRB260207A_cand41148_geo")
@@ -102,7 +103,12 @@ if __name__=="__main__":
     
     jitter = fit_jitter(ydata, yerr)
     flux_offset = get_preburst_fluxoff(ydata, yerr, jitter)
-    
+
+    # All post-trigger data, for plotting
+    t_post = tbins[tends > 0]
+    y_post = -data[:,1][tends > 0] - flux_offset
+    yerr_post = np.sqrt(data[:,2][tends > 0]**2 + jitter**2)
+
     # forward shock
     subtbins = tbins[(tends > 0) & (tbins < FORWARDSTOP)]
     ydata = -data[:,1][(tends >0) & (tbins < FORWARDSTOP)] - flux_offset
@@ -112,28 +118,15 @@ if __name__=="__main__":
     flat_samples = fsfitter.samples()
     bestfit = fsfitter.bestfit()
     
-    print_red_chi2(ydata, fs_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))  
+    chi2_r = print_red_chi2(ydata, fs_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))
 
-    fig = corner.corner(flat_samples, labels=list(PRIOR_FS.keys()))
-    plt.savefig("corner.png")
-    plt.close()
-    fig = plt.figure()
-    plt.errorbar(subtbins+CADENCE/2,ydata*TOT_CTS_TO_JY,xerr=CADENCE/2,yerr=yerr*TOT_CTS_TO_JY,ls='none')
-    plt.errorbar(subtbins+CADENCE/2,fs_model(subtbins+CADENCE/2,bestfit)*TOT_CTS_TO_JY,xerr=CADENCE/2,ls='none',marker='s',color='red')
-    inds = np.random.randint(len(flat_samples),size=100)
-    x0 = np.geomspace(1e-4, subtbins.max(),1000)
-    for ind in inds:
-        sample = flat_samples[ind]
-        plt.plot(x0, fs_model(x0,sample)*TOT_CTS_TO_JY, "C1", alpha=0.1)
+    save_corner("corner.png", flat_samples, fsfitter.names)
+    save_lightcurve("lightcurve.png", t_post, y_post, yerr_post, t_post < FORWARDSTOP,
+                    fs_model, bestfit, flat_samples, chi2_r,
+                    title='Forward shock only', color='royalblue',
+                    cadence=CADENCE, to_jy=TOT_CTS_TO_JY)
 
-    
-    ax = plt.gca()
-    ax.set_xscale('symlog', linthresh=2e-3)
-    ax.set_yscale('log')
-    plt.savefig("lightcurve.png")
-    plt.close()
-
-    # full evolution 
+    # full evolution
     bestfwd = bestfit
     def inj_model(t, theta):
         logF0, logtb, p = bestfwd
@@ -146,23 +139,20 @@ if __name__=="__main__":
     flat_samples = injfitter.samples()
     bestfit = injfitter.bestfit()
     
-    print_red_chi2(ydata, inj_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))  
+    chi2_r = print_red_chi2(ydata, inj_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))
 
-    fig = corner.corner(flat_samples, labels=list(PRIOR_INJ.keys()))
-    plt.savefig("injcorner.png")
-    plt.close()
-    fig = plt.figure()
-    plt.errorbar(subtbins+CADENCE/2,ydata*TOT_CTS_TO_JY,xerr=CADENCE/2,yerr=yerr*TOT_CTS_TO_JY,ls='none')
-    plt.errorbar(subtbins+CADENCE/2,inj_model(subtbins+CADENCE/2,bestfit)*TOT_CTS_TO_JY,xerr=CADENCE/2,ls='none',marker='s',color='red')
-    inds = np.random.randint(len(flat_samples),size=100)
-    x0 = np.geomspace(1e-4, subtbins.max(),1000)
-    for ind in inds:
-        sample = flat_samples[ind]
-        plt.plot(x0, inj_model(x0,sample)*TOT_CTS_TO_JY, "C1", alpha=0.1)
+    # A log flux of -50 switches a component off
+    OFF = -50.0
+    components = [
+        ('Unrefreshed FS', lambda t: fs_model(t, bestfwd), '--', 'dimgray'),
+        ('Refreshed FS', lambda t: inj_model(t, [OFF, *bestfit[1:]]), '--', 'darkorange'),
+        ('Reverse shock', lambda t: lcmodel.injection(t, K, OFF, *bestfwd[1:], *bestfit), ':', 'crimson'),
+    ]
+    tinj = bestfit[injfitter.names.index('tinj')]
 
-    
-    ax = plt.gca()
-    ax.set_xscale('symlog', linthresh=2e-3)
-    ax.set_yscale('log')
-    plt.savefig("injlightcurve.png")
-    plt.close()
+    save_corner("injcorner.png", flat_samples, injfitter.names)
+    save_lightcurve("injlightcurve.png", t_post, y_post, yerr_post, t_post < 1,
+                    inj_model, bestfit, flat_samples, chi2_r,
+                    title='Forward shock with energy injection and reverse shock', color='navy',
+                    cadence=CADENCE, to_jy=TOT_CTS_TO_JY,
+                    components=components, vlines=[(tinj, r'$t_{\rm inj}$')])
