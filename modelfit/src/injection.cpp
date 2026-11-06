@@ -60,6 +60,20 @@ namespace {
       return std::exp(lnF0 - a1 * lx - c * (sp - LN2));
     }
   };
+  struct inj {
+  double kE, tinj, tend, eta;
+    inj(double logtinj, double logtend, double k, double eta, double p) {
+      kE = ((4 - k)*(p + 3) - 2*k)/ (4*(4-k)) ; 
+      tinj = std::pow(10,logtinj) ; 
+      tend = std::pow(10,logtend) ; 
+      this->eta=eta;
+      }
+    double operator()(double t) const{
+      if (t < tinj) return 1.0;
+      else if (t < tend) return std::pow(t/tinj, kE*eta);
+      else return std::pow(tend/tinj, kE*eta);
+      }
+  };
 }
 
 
@@ -68,16 +82,17 @@ using darray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
 py::array_t<double> model(darray t, double k, double logF0, double logtb, double p,
                           double logF0rev, double logtbrev, double a1, double a2, 
-                          double tinj, double logEinj){
+                          double logtinj, double logdeltatinj, double eta, double logEinj){
   auto tin = t.unchecked<1>();   //throws if t is not 1-D
   const py::ssize_t n = tin.shape(0);
 
   py::array_t <double> out(n);
   auto o = out.mutable_unchecked<1>();
-
+  double tinj = std::pow(10, logtinj) ; 
+  double logtend = std::log10(tinj + std::pow(10,logdeltatinj));
   fwd f1(logF0, logtb, k, p);
   rev f2(logF0rev, std::log10(std::pow(10, logtbrev) - tinj), k, p, a1, a2);
-
+  inj f3(logtinj, logtend, k, eta, p);
   for (py::ssize_t i=0; i<n; ++i){
     const double t_start = tin(i) ; 
     double total = 0.0;
@@ -86,13 +101,7 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
       double sum = 0.0, lo = INFINITY, hi = -INFINITY;
       for (int s=0; s<BLOCK_LEN; ++s){
         const double ts = t_start + (b*BLOCK_LEN + s + 0.5)*SUB_DT;
-        double inj = 1;
-        double frev = 0;
-        if (ts > tinj) {
-          inj=std::pow(10,logEinj);
-          frev  = f2(ts-tinj);
-        }
-        const double fl = f1(ts)*inj+frev;
+        const double fl = f1(ts)*f3(ts)+f2(ts-tinj);
         sum += fl; 
         lo = std::fmin(lo,fl);
         hi = std::fmax(hi, fl);
@@ -107,7 +116,8 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
 void register_injection(py::module_ &m){
   m.def("injection", &model, "t"_a, "k"_a, "logf0"_a, "logtb"_a, 
         "p"_a,"logF0rev"_a,"logtbrev"_a,"a1"_a, 
-        "a2"_a, "tinj"_a, "logEinj"_a,
+        "a2"_a, "logtinj"_a, "logdeltatinj"_a,
+        "eta"_a,"logEinj"_a,
         "Compute model flux as times t");
   }
 

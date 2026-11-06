@@ -19,17 +19,19 @@ PRIOR_FS = {
 }
 
 PRIOR_INJ = {
-    'logF0rev': (0, 1),
+    'logF0rev': (0, 5),
     'logtbrev': (-1.6,-1.2),
     'a1': (-3,-1),
     'a2': (1.5,3),
-    'tinj': (0.008, 0.02),
+    'logtinj': (np.log10(0.008), np.log10(0.02)),
+    'logdeltatinj': (np.log10(0.001), np.log10(0.02)),
+    'eta': (0,3-K),
     'logEinj': (0,6)
 }
 
 theta0_FS = np.array([np.log10(1e3), np.log10(0.01), 2.2])
 theta0_INJ = np.array([np.log10(1e3), np.log10(0.04), -1.5,
-                       2, 0.01, 2])
+                       2, np.log10(0.01),np.log10(0.01),2, 2])
 
 def fs_model(t, theta):
     return lcmodel.forwardshock(t, K, *theta)
@@ -148,7 +150,7 @@ if __name__=="__main__":
         ('Refreshed FS', lambda t: inj_model(t, [OFF, *bestfit[1:]]), '--', 'darkorange'),
         ('Reverse shock', lambda t: lcmodel.injection(t, K, OFF, *bestfwd[1:], *bestfit), ':', 'crimson'),
     ]
-    tinj = bestfit[injfitter.names.index('tinj')]
+    tinj = 10**bestfit[injfitter.names.index('logtinj')]
 
     save_corner("injcorner.png", flat_samples, injfitter.names)
     save_lightcurve("injlightcurve.png", t_post, y_post, yerr_post, t_post < 1,
