@@ -42,8 +42,8 @@ namespace {
   };
   struct rev {
     double lnF0, lntb, a1, c, invS;
-    rev(double logF0, double logtb, double k, double p, double a1, double a2) {
-      
+    rev(double logF0, double logtb, double k, double p, double a1) {
+      const double a2 = (73*p + 21 - 14*k*p - 6*k) / (24*(4 - k));   // thick shell, practically identical to thin shell
       lnF0 = logF0 * LN10;
       lntb = logtb * LN10;
       invS = 1.0 / S;
@@ -81,7 +81,7 @@ namespace {
 using darray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
 py::array_t<double> model(darray t, double k, double logF0, double logtb, double p,
-                          double logF0rev, double logdeltatbrev, double a1, double a2, 
+                          double logF0rev, double logdeltatbrev, double a1, 
                           double logtinj, double logdeltatinj, double eta){
   auto tin = t.unchecked<1>();   //throws if t is not 1-D
   const py::ssize_t n = tin.shape(0);
@@ -91,7 +91,7 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
   double tinj = std::pow(10, logtinj) ; 
   double logtend = std::log10(tinj + std::pow(10,logdeltatinj));
   fwd f1(logF0, logtb, k, p);
-  rev f2(logF0rev, logdeltatbrev, k, p, a1, a2);
+  rev f2(logF0rev, logdeltatbrev, k, p, a1);
   inj f3(logtinj, logtend, k, eta, p);
   for (py::ssize_t i=0; i<n; ++i){
     const double t_start = tin(i) ; 
@@ -116,7 +116,7 @@ py::array_t<double> model(darray t, double k, double logF0, double logtb, double
 void register_injection(py::module_ &m){
   m.def("injection", &model, "t"_a, "k"_a, "logf0"_a, "logtb"_a, 
         "p"_a,"logF0rev"_a,"logdeltatbrev"_a,"a1"_a, 
-        "a2"_a, "logtinj"_a, "logdeltatinj"_a,
+        "logtinj"_a, "logdeltatinj"_a,
         "eta"_a,
         "Compute model flux as times t");
   }

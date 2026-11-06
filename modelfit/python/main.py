@@ -27,7 +27,6 @@ PRIOR_INJ = {
     'logF0rev': (np.log10(1), np.log10(1e5)),
     'logdeltatbrev': (np.log10(0.005),np.log10(0.06)),
     'a1': (-4, 0),
-    'a2': (0,4),
     'logtinj': (np.log10(0.015), np.log10(0.03)),
     'logdeltatinj': (np.log10(0.001), np.log10(0.02)),
     'eta': (0,3-K),
@@ -42,7 +41,6 @@ LATEX_LABELS = {
     'logF0rev': r'$\log_{10} F_{0,\rm rev}$',
     'logdeltatbrev': r'$\log_{10} \Delta t_{b,\rm rev}$',
     'a1': r'$\alpha_1$',
-    'a2': r'$\alpha_2$',
     'logtinj': r'$\log_{10} t_{\rm inj}$',
     'logdeltatinj': r'$\log_{10} \Delta t_{\rm inj}$',
     'eta': r'$\eta$',
@@ -50,7 +48,7 @@ LATEX_LABELS = {
 
 theta0_FS = np.array([np.log10(1e2), np.log10(0.01), 2.2])
 theta0_INJ = np.array([np.log10(1e3), np.log10(0.02), -1.5,
-                       2, np.log10(0.02),np.log10(0.01), 2])
+                       np.log10(0.02),np.log10(0.01), 2])
 
 def fs_model(t, theta):
     return lcmodel.forwardshock(t, K, *theta)
