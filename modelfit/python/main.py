@@ -1,9 +1,14 @@
-import numpy as np 
+import numpy as np
 import emcee
 from astropy.time import Time
 import lcmodel
 from jitter import fit_jitter
 from plotting import save_corner, save_lightcurve
+import argparse 
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--quick",action="store_true")
+args = parser.parse_args()
 
 CADENCE = 200.0/60.0/60.0/24.0
 TRIGGER = Time("2026-02-07 05:42:33.65").jd - 2457000
@@ -19,23 +24,37 @@ PRIOR_FS = {
 }
 
 PRIOR_INJ = {
-    'logF0rev': (0, 5),
-    'logtbrev': (-1.6,-1.2),
+    'logF0rev': (np.log10(1), np.log10(1e5)),
+    'logdeltatbrev': (np.log10(0.005),np.log10(0.06)),
     'a1': (-3,-1),
     'a2': (1.5,3),
-    'logtinj': (np.log10(0.008), np.log10(0.02)),
+    'logtinj': (np.log10(0.015), np.log10(0.03)),
     'logdeltatinj': (np.log10(0.001), np.log10(0.02)),
     'eta': (0,3-K),
-    'logEinj': (0,6)
 }
 
-theta0_FS = np.array([np.log10(1e3), np.log10(0.01), 2.2])
-theta0_INJ = np.array([np.log10(1e3), np.log10(0.04), -1.5,
-                       2, np.log10(0.01),np.log10(0.01),2, 2])
+# Cosmetic only -- corner-plot display labels, keyed by the same names as
+# PRIOR_FS/PRIOR_INJ above but kept separate so plotting never touches fitting.
+LATEX_LABELS = {
+    'logF0': r'$\log_{10} F_0$',
+    'logTb': r'$\log_{10} t_b$',
+    'p': r'$p$',
+    'logF0rev': r'$\log_{10} F_{0,\rm rev}$',
+    'logdeltatbrev': r'$\log_{10} \Delta t_{b,\rm rev}$',
+    'a1': r'$\alpha_1$',
+    'a2': r'$\alpha_2$',
+    'logtinj': r'$\log_{10} t_{\rm inj}$',
+    'logdeltatinj': r'$\log_{10} \Delta t_{\rm inj}$',
+    'eta': r'$\eta$',
+}
+
+theta0_FS = np.array([np.log10(1e2), np.log10(0.01), 2.2])
+theta0_INJ = np.array([np.log10(1e3), np.log10(0.02), -1.5,
+                       2, np.log10(0.02),np.log10(0.01), 2])
 
 def fs_model(t, theta):
     return lcmodel.forwardshock(t, K, *theta)
-    
+
 class Fit:
     def __init__(self, names, priors, model, t, y, yerr):
         self.names = names
@@ -122,7 +141,7 @@ if __name__=="__main__":
     
     chi2_r = print_red_chi2(ydata, fs_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))
 
-    save_corner("corner.png", flat_samples, fsfitter.names)
+    save_corner("corner.png", flat_samples, [LATEX_LABELS[n] for n in fsfitter.names])
     save_lightcurve("lightcurve.png", t_post, y_post, yerr_post, t_post < FORWARDSTOP,
                     fs_model, bestfit, flat_samples, chi2_r,
                     title='Forward shock only', color='royalblue',
@@ -137,7 +156,10 @@ if __name__=="__main__":
     ydata = -data[:,1][(tends >0) & (tbins < 1)] - flux_offset
     yerr = np.sqrt(data[:,2][(tends > 0) & (tbins < 1)]**2 + jitter**2)
     injfitter = Fit(list(PRIOR_INJ.keys()), PRIOR_INJ, inj_model, subtbins, ydata, yerr)
-    injfitter.run(theta0_INJ)
+    if args.quick:
+        injfitter.run(theta0_INJ,nburn=500, nsteps=1000)
+    else:
+        injfitter.run(theta0_INJ)
     flat_samples = injfitter.samples()
     bestfit = injfitter.bestfit()
     
@@ -152,7 +174,7 @@ if __name__=="__main__":
     ]
     tinj = 10**bestfit[injfitter.names.index('logtinj')]
 
-    save_corner("injcorner.png", flat_samples, injfitter.names)
+    save_corner("injcorner.png", flat_samples, [LATEX_LABELS[n] for n in injfitter.names])
     save_lightcurve("injlightcurve.png", t_post, y_post, yerr_post, t_post < 1,
                     inj_model, bestfit, flat_samples, chi2_r,
                     title='Forward shock with energy injection and reverse shock', color='navy',

@@ -7,19 +7,6 @@ from matplotlib.transforms import blended_transform_factory
 X_MIN, X_MAX = 1e-4, 13
 MINUTE_TICKS = [0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 17000]
 
-CORNER_LABELS = {
-    'logF0': r'$\log_{10} F_0$',
-    'logTb': r'$\log_{10} t_b$',
-    'p': r'$p$',
-    'logF0rev': r'$\log_{10} F_{0,\rm rev}$',
-    'logtbrev': r'$\log_{10} t_{b,\rm rev}$',
-    'a1': r'$\alpha_1$',
-    'a2': r'$\alpha_2$',
-    'tinj': r'$t_{\rm inj}\ (\mathrm{d})$',
-    'logEinj': r'$\log_{10} E_{\rm inj}$',
-}
-
-
 def _corner_title(values):
     q16, q50, q84 = np.percentile(values, [16, 50, 84])
     upper, lower = q84 - q50, q50 - q16
@@ -29,9 +16,9 @@ def _corner_title(values):
     return rf'${q50:.{decimals}f}^{{+{upper:.{decimals}f}}}_{{-{lower:.{decimals}f}}}$'
 
 
-def save_corner(path, samples, names):
+def save_corner(path, samples, labels):
     kwargs = dict(
-        labels=[CORNER_LABELS[name] for name in names],
+        labels=labels,
         quantiles=[0.16, 0.5, 0.84],
         label_kwargs={'fontsize': 15, 'labelpad': 12},
     )
@@ -41,8 +28,8 @@ def save_corner(path, samples, names):
     except Exception:  # no working LaTeX install
         fig = corner.corner(samples, **kwargs)
 
-    axes = np.array(fig.axes).reshape(len(names), len(names))
-    for i in range(len(names)):
+    axes = np.array(fig.axes).reshape(len(labels), len(labels))
+    for i in range(len(labels)):
         axes[i, i].set_title(_corner_title(samples[:, i]), fontsize=13)
     for ax in fig.axes:
         ax.tick_params(axis='both', labelsize=11, pad=3)
@@ -125,10 +112,10 @@ def save_lightcurve(path, t, y, yerr, mask_fit, model, theta_best, samples, chi2
     # Bin centers, except the bin straddling the trigger: its center can be negative,
     # so it's plotted at the middle of the part after the trigger.
     x = (np.maximum(t, 0) + t + cadence) / 2
-    # The model is binned, so a curve at time x uses the bin plotted at x (the inverse
-    # of the mapping above).
+    # The model is binned, so a curve plotted at bin-center x uses a bin starting
+    # cadence/2 earlier.
     x_model = np.geomspace(2e-4, X_MAX, 1500)
-    t_model = np.where(x_model < cadence / 2, 2 * x_model - cadence, x_model - cadence / 2)
+    t_model = x_model - cadence / 2
 
     y_jy, yerr_jy = y * to_jy, yerr * to_jy
     fig, (ax, ax_res) = plt.subplots(2, 1, figsize=(8, 9), sharex=True,
