@@ -26,8 +26,8 @@ PRIOR_FS = {
 PRIOR_INJ = {
     'logF0rev': (np.log10(1), np.log10(1e5)),
     'logdeltatbrev': (np.log10(0.005),np.log10(0.06)),
-    'a1': (-3,-1),
-    'a2': (1.5,3),
+    'a1': (-4, 0),
+    'a2': (0,4),
     'logtinj': (np.log10(0.015), np.log10(0.03)),
     'logdeltatinj': (np.log10(0.001), np.log10(0.02)),
     'eta': (0,3-K),
@@ -141,8 +141,8 @@ if __name__=="__main__":
     
     chi2_r = print_red_chi2(ydata, fs_model(subtbins, bestfit), yerr, len(ydata)-len(bestfit))
 
-    save_corner("corner.png", flat_samples, [LATEX_LABELS[n] for n in fsfitter.names])
-    save_lightcurve("lightcurve.png", t_post, y_post, yerr_post, t_post < FORWARDSTOP,
+    save_corner("FScorner.png", flat_samples, [LATEX_LABELS[n] for n in fsfitter.names])
+    save_lightcurve("FSlightcurve.png", t_post, y_post, yerr_post, t_post < FORWARDSTOP,
                     fs_model, bestfit, flat_samples, chi2_r,
                     title='Forward shock only', color='royalblue',
                     cadence=CADENCE, to_jy=TOT_CTS_TO_JY)
