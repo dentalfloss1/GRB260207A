@@ -5,8 +5,7 @@
 - [x] Plotting + plot formatting (LLM help allowed here).
 - [x] Replace the instant injection step with a finite ramp.
 - [x] Fix the reverse shock to physically justified values (maybe).
-- [ ] Make final checks on unconstrained parameters (e.g. reverse shock rise/decay).
+- [x] Make final checks on unconstrained parameters (e.g. reverse shock rise/decay).
 - [ ] Refactor plotting code (Claude wrote it in an unreadable way).
 - [ ] Re-add MASTER data point.
 
-No more alarms.
